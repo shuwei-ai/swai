@@ -1,0 +1,16 @@
+[
+  {
+    "insert": [
+      { "id": "swai-tools", "name": "./swai-tools.mjs" },
+      {
+        "id": "swai-mcp",
+        "name": "@deepseek-ai/dsh-mcp-client",
+        "config": {
+          "transport": "streamable-http",
+          "serverName": "swai",
+          "url": "http://127.0.0.1:39001/mcp"
+        }
+      }
+    ]
+  }
+]

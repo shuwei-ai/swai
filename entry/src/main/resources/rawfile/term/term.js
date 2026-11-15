@@ -1,0 +1,763 @@
+// Initialize xterm.js
+// The Terminal instance is created lazily in initialize() (see createTerminal),
+// because renderer options depend on native preferences (ligatures / italic).
+var term = null;
+
+// Tracks the currently selected font family so user fonts can re-apply it
+// once their FontFace finishes loading asynchronously.
+var currentFontFamily = 'Default';
+
+// Initialize Addons (constructed upfront; attached to term in createTerminal)
+const fitAddon = new FitAddon.FitAddon();
+const webglAddon = new WebglAddon.WebglAddon();
+
+// Initialize exports for ArkTS to call
+window.exports = {};
+
+// Helper for decoding Latin1/Binary string from ArkTS to UTF-8
+const decoder = new TextDecoder('utf-8');
+const encoder = new TextEncoder();
+
+function setupImeGuard() {
+    if (!term.textarea) {
+        return;
+    }
+    const textarea = term.textarea;
+    textarea.setAttribute('autocomplete', 'off');
+    textarea.setAttribute('autocorrect', 'off');
+    textarea.setAttribute('spellcheck', 'false');
+    textarea.setAttribute('autocapitalize', 'off');
+}
+
+// Detects which monospace fonts are actually available in the WebView.
+// Uses Canvas measureText: compares "CandidateFont, monospace" against
+// pure "monospace" baseline. If a font doesn't exist, the browser falls
+// back to monospace and the widths match → it gets filtered out.
+function detectAvailableMonospaceFonts() {
+    var testNarrow = 'iiiiilllll';
+    var testWide = 'WWWWWmmmmm';
+    var baseFont = 'monospace';
+
+    // Comprehensive list of monospace fonts commonly available across
+    // HarmonyOS / Android / Linux systems
+    var candidates = [
+        'Droid Sans Mono',
+        'Noto Sans Mono',
+        'Roboto Mono',
+        'Source Code Pro',
+        'Cascadia Code',
+        'Fira Code',
+        'JetBrains Mono',
+        'Courier New',
+        'Courier',
+        'Consolas',
+        'Menlo',
+        'DejaVu Sans Mono',
+        'Liberation Mono',
+        'Ubuntu Mono',
+        'Monaco',
+    ];
+
+    var canvas = document.createElement('canvas');
+    var ctx = canvas.getContext('2d');
+    var testFontSize = '16px';
+
+    function measure(fontStack, text) {
+        ctx.font = testFontSize + ' ' + fontStack;
+        return ctx.measureText(text).width;
+    }
+
+    // Baseline with pure monospace (the browser's default monospace font)
+    var monoNarrow = measure(baseFont, testNarrow);
+    var monoWide = measure(baseFont, testWide);
+
+    return candidates.filter(function(font) {
+        // Measure with candidate + monospace fallback.
+        // If the candidate font does NOT exist, the browser falls back
+        // to monospace → same metrics as baseline → detected as unavailable.
+        // If it DOES exist → different metrics → detected as available.
+        var fontStack = '"' + font + '", ' + baseFont;
+        var narrow = measure(fontStack, testNarrow);
+        var wide = measure(fontStack, testWide);
+
+        // Font is distinct from default monospace (it actually exists and differs)
+        var narrowDiff = Math.abs(narrow - monoNarrow);
+        var wideDiff = Math.abs(wide - monoWide);
+        var isDistinct = narrowDiff > 0.5 || wideDiff > 0.5;
+
+        // Font is monospace: narrow and wide chars have equal width
+        // (1px tolerance for sub-pixel rendering differences)
+        var monoDiff = Math.abs(narrow - wide);
+        var isMonospace = monoDiff <= 1;
+
+        return isDistinct && isMonospace;
+    });
+}
+
+// Maps user-friendly font family name to CSS font-family stack.
+// 'Default' uses the system monospace fallback chain;
+// named fonts include a monospace fallback for safety.
+function mapFontFamily(family) {
+    if (!family || family === 'Default') {
+        return 'monospace, "Droid Sans Mono", "Courier New", "Courier", monospace';
+    }
+    return '"' + family + '", monospace';
+}
+
+// Function to convert "binary string" (where charCode < 256) to Uint8Array
+// ArkTS sends data as a string where each char is a byte.
+function strToUint8Array(str) {
+    const buf = new Uint8Array(str.length);
+    for (let i = 0; i < str.length; i++) {
+        buf[i] = str.charCodeAt(i);
+    }
+    return buf;
+}
+
+// Creates the xterm.js Terminal instance.
+// NOTE: This xterm.js build ships with the DOM renderer only (no
+// canvas/WebGL/rendererType option), so ligature and italic suppression
+// are both handled purely via CSS classes on <body> — see term.css.
+function createTerminal() {
+    var ligatures = false;
+    var italic = true;
+    try {
+        if (window.native && native.getLigatures) {
+            ligatures = !!native.getLigatures();
+        }
+        if (window.native && native.getItalic) {
+            italic = !!native.getItalic();
+        }
+    } catch (e) {
+        console.warn('Failed to read renderer prefs', e);
+    }
+
+    if (!ligatures) {
+        document.body.classList.add('ligatures-off');
+    }
+    if (!italic) {
+        document.body.classList.add('italics-off');
+    }
+
+    var options = {
+        cursorBlink: true,
+        allowProposedApi: true, // Needed for some addons
+        allowTransparency: true, // User preference: Transparency supported
+        fontFamily: 'monospace, "Droid Sans Mono", "Courier New", "Courier", monospace',
+        fontSize: 14, // Default, will be overridden by native.getFontSize()
+        theme: {
+            background: 'rgba(0, 0, 0, 0)', // Transparent by default to show effects behind
+            foreground: '#ffffff',
+            cursor: '#ffffff'
+        },
+        screenReaderMode: false, // Disabled to fix touch scrolling issues (was conflicting with native selection)
+        scrollback: 3000, // [Optimization] Limit scrollback to 3000 lines (Ring Buffer) to prevent memory overflow
+    };
+
+    term = new Terminal(options);
+    term.loadAddon(fitAddon);
+
+    // Link clicks
+    term.options.linkHandler = {
+        activate: (e, text) => {
+            if (native && native.openLink) native.openLink(text);
+        }
+    };
+
+    // Setup global term object for debugging if needed
+    window.term = term;
+}
+
+// Main initialization function
+window.onload = function () {
+    // Retry mechanism for native object injection
+    let retryCount = 0;
+    const maxRetries = 10;
+
+    function initialize() {
+        // Disable WebGL as per user request (Compatibility Mode)
+        let shouldEnableWebGL = false;
+
+        // Check if native is ready
+        if (!window.native && retryCount < maxRetries) {
+            console.log(`Waiting for native object... (${retryCount + 1}/${maxRetries})`);
+            retryCount++;
+            setTimeout(initialize, 200);
+            return;
+        }
+
+        // Initial fit with a slight delay to ensure container is ready
+        setTimeout(() => {
+            // 0. Create terminal and open it
+            try {
+                createTerminal();
+                term.open(document.getElementById('terminal'));
+                setupImeGuard();
+            } catch (e) {
+                console.error("Failed to create terminal", e);
+                return;
+            }
+
+            // 1. Setup event listeners and sync preferences FIRST
+            //    确保 term.onResize 在 fitAddon.fit() 之前设置好，
+            //    这样首次 fit 的 resize 事件才能触发 native.resize() 发送给 VM 内核
+            try {
+                syncPrefs();
+                setupEventListeners();
+            } catch (e) {
+                console.error("Error during setup", e);
+            }
+
+            // 2. Detect available monospace fonts
+            //    Preload bundled fonts first to ensure they're detected
+            try {
+                // Bundled fonts — always available, loaded via fonts.css @font-face
+                var bundledFonts = ['JetBrains Mono', 'Fira Code', 'Source Code Pro'];
+                var preloadPromises = [];
+                if (document.fonts && document.fonts.load) {
+                    for (var b = 0; b < bundledFonts.length; b++) {
+                        preloadPromises.push(
+                            document.fonts.load('14px "' + bundledFonts[b] + '"')
+                                .catch(function() { /* ignore individual load failures */ })
+                        );
+                    }
+                }
+                // Run detection after preload (with timeout fallback)
+                var doDetection = function() {
+                    var availableFonts = detectAvailableMonospaceFonts();
+                    // Ensure bundled fonts are always present (their woff2 files are baked in)
+                    for (var k = 0; k < bundledFonts.length; k++) {
+                        if (availableFonts.indexOf(bundledFonts[k]) === -1) {
+                            availableFonts.push(bundledFonts[k]);
+                        }
+                    }
+                    console.log('Detected monospace fonts: ' + availableFonts.join(', '));
+                    if (native.onAvailableFontsDetected) {
+                        native.onAvailableFontsDetected(JSON.stringify(availableFonts));
+                    }
+                };
+                if (preloadPromises.length > 0) {
+                    // Wait up to 2s for fonts to load, then run detection
+                    Promise.race([
+                        Promise.all(preloadPromises),
+                        new Promise(function(r) { setTimeout(r, 2000); })
+                    ]).then(doDetection);
+                } else {
+                    doDetection();
+                }
+            } catch (e) {
+                console.warn('Font detection failed', e);
+            }
+
+            // 3. Fit Terminal (now onResize listener is ready to capture this)
+            try {
+                fitAddon.fit();
+                console.log(`Terminal size after fit: ${term.cols}x${term.rows}`);
+
+                // If fit failed (size 0), force a default size
+                if (term.cols < 2 || term.rows < 2) {
+                    term.resize(80, 24);
+                    console.log("Forced resize to 80x24");
+                }
+            } catch (e) {
+                console.error("Fit failed", e);
+                term.resize(80, 24); // Fallback
+            }
+
+            // 4. Load WebGL (unavailable in this DOM-renderer-only build)
+            if (shouldEnableWebGL) {
+                try {
+                    webglAddon.onContextLoss(e => {
+                        webglAddon.dispose();
+                    });
+                    term.loadAddon(webglAddon);
+                    console.log("WebGL renderer loaded");
+                } catch (e) {
+                    console.warn("WebGL renderer failed to load, falling back to canvas", e);
+                }
+            }
+
+            // 5. Initialize and Start Shell
+            try {
+                // Swai Shell Terminal Initial Banner
+                term.writeln(
+                    '\x1b[1;36m=== Swai Native Terminal (uid 2000 / shell) ===\x1b[0m\r\n' +
+                    '\x1b[90mPowered by HiSH xterm.js engine with ANSI & virtual keys\x1b[0m\r\n'
+                );
+
+                // Notify native that we are ready
+                if (window.native && native.load) {
+                    native.load();
+                } else {
+                    console.error("Native object still missing after retries");
+                    term.writeln('\r\nError: Native bridge failed to initialize.\r\n');
+                }
+            } catch (e) {
+                console.error("Error during init/load", e);
+            }
+
+        }, 300); // 300ms delay to ensure container is ready
+    }
+
+    // Start initialization
+    initialize();
+};
+
+function syncPrefs() {
+    try {
+        if (native.getFontSize) {
+            const fs = native.getFontSize();
+            if (fs) term.options.fontSize = fs;
+        }
+        if (native.getFontFamily) {
+            const ff = native.getFontFamily();
+            if (ff) exports.setFontFamily(ff);
+        }
+        if (native.getCursorBlink) {
+            const blink = native.getCursorBlink();
+            if (blink) term.options.cursorBlink = blink;
+        }
+        if (native.getCursorShape) {
+            const shape = native.getCursorShape();
+            if (shape) exports.setCursorShape(shape); // Use our adapter logic
+        }
+        if (native.getBackgroundColor) {
+            const bg = native.getBackgroundColor();
+            if (bg) exports.setBackgroundColor(bg);
+        }
+        if (native.getBackgroundImage) {
+            const img = native.getBackgroundImage();
+            if (img) exports.setBackgroundImage(img);
+        }
+        if (native.getBackgroundBlur) {
+            const blur = native.getBackgroundBlur();
+            if (blur) exports.setBackgroundBlur(blur);
+        }
+        if (native.getUserFonts) {
+            const fontsJson = native.getUserFonts();
+            if (fontsJson) registerUserFonts(fontsJson);
+        }
+    } catch (e) {
+        console.warn("Failed to sync prefs", e);
+    }
+}
+
+// Registers user-uploaded fonts (JSON array of {name, dataUrl}) via FontFace.
+function registerUserFonts(json) {
+    try {
+        var fonts = JSON.parse(json);
+        for (var i = 0; i < fonts.length; i++) {
+            exports.addUserFont(fonts[i].name, fonts[i].dataUrl);
+        }
+    } catch (e) {
+        console.warn('registerUserFonts failed', e);
+    }
+}
+exports.registerUserFonts = registerUserFonts;
+
+function setupEventListeners() {
+    // 1. Input from User (Keyboard/Mouse) -> Send to VM
+    term.onData(data => {
+        // Pass data directly to native (matching original hterm behavior)
+        if (native && native.sendInput) {
+            native.sendInput(data);
+        }
+    });
+
+    // 2. Resize -> Notify Native
+    term.onResize(size => {
+        if (native && native.resize) {
+            native.resize(size.cols, size.rows);
+        }
+    });
+
+    // 3. Selection Change -> Notify Native
+    term.onSelectionChange(() => {
+        const text = term.getSelection();
+        if (native && native.onSelectionChange) {
+            native.onSelectionChange(text);
+        }
+    });
+
+    // 4. Handle Window Resize
+    window.addEventListener('resize', () => {
+        setTimeout(() => fitAddon.fit(), 100);
+    });
+
+    // 5. Prevent default browser behaviors that might interfere
+    document.addEventListener('keydown', (e) => {
+        // Allow some system shortcuts if needed, but generally intercept
+        if (e.ctrlKey || e.altKey || (e.keyCode >= 112 && e.keyCode <= 123)) {
+            // Let xterm handle it or prevent default
+        }
+    }, { passive: false });
+
+    // --- Touch gesture arbitration + fling (momentum) scrolling ---
+    // Terminal content is not natively scrollable: the visible layers are
+    // fixed and xterm emulates scrolling by writing viewport.scrollTop in its
+    // own touchmove handler on #terminal. When the drag starts on selectable
+    // text (user-select: text, kept for long-press copy), the WebView may
+    // claim the gesture for text selection and cancel the touch stream —
+    // which made swiping over text feel stuck.
+    //
+    // Arbitration:
+    //   - Swipe past the slop threshold → claim the gesture via
+    //     preventDefault() so the browser never turns it into a selection or
+    //     pan gesture; xterm's handler still receives the events and scrolls.
+    //   - Selection appearing mid-gesture (long-press) → hand the stream back
+    //     to the browser so word selection + copy keep working.
+    //   - Multi-touch (pinch zoom) is left untouched.
+    //
+    // Fling: while a scroll gesture is active, sample touch positions and on
+    // release keep scrolling with an exponentially decaying velocity (rAF).
+    // Buffer/render sync needs no extra work — xterm's 'scroll' listener on
+    // .xterm-viewport fires for every scrollTop change (same path as wheel).
+    var touchStartX = 0;
+    var touchStartY = 0;
+    var touchHadSelection = false;
+    var gestureDecided = false;
+    var isScrollGesture = false;
+    var TOUCH_SLOP = 8;
+
+    var touchSamples = []; // [{y, t}] recent scroll-gesture positions
+    var flingRafId = 0;
+    var FLING_SAMPLE_MS = 100;    // velocity estimation window
+    var FLING_MIN_VELOCITY = 0.1; // px/ms; slower release counts as a stop
+    var FLING_MAX_VELOCITY = 5;   // px/ms safety cap
+    var FLING_FRICTION_MS = 350;  // decay time constant (Android-like feel)
+    var FLING_MIN_SPEED = 0.01;   // px/ms stop threshold
+
+    function stopFling() {
+        if (flingRafId) {
+            cancelAnimationFrame(flingRafId);
+            flingRafId = 0;
+        }
+    }
+
+    function startFling(velocity) {
+        var vp = document.querySelector('#terminal .xterm-viewport');
+        if (!vp) return;
+        stopFling();
+        var v = velocity;
+        var lastTime = performance.now();
+        var step = function (now) {
+            var dt = now - lastTime;
+            lastTime = now;
+            var before = vp.scrollTop;
+            vp.scrollTop = before + v * dt;
+            // Unchanged scrollTop → hit the top/bottom bound (or no scrollback)
+            if (vp.scrollTop === before) {
+                flingRafId = 0;
+                return;
+            }
+            v *= Math.exp(-dt / FLING_FRICTION_MS);
+            if (Math.abs(v) > FLING_MIN_SPEED) {
+                flingRafId = requestAnimationFrame(step);
+            } else {
+                flingRafId = 0;
+            }
+        };
+        flingRafId = requestAnimationFrame(step);
+    }
+
+    function nativeSelectionActive() {
+        var s = window.getSelection();
+        return !!(s && !s.isCollapsed);
+    }
+
+    document.addEventListener('touchstart', (e) => {
+        stopFling();
+        touchSamples = [];
+        if (e.touches.length !== 1) {
+            gestureDecided = true;
+            isScrollGesture = false;
+            return;
+        }
+        touchStartX = e.touches[0].clientX;
+        touchStartY = e.touches[0].clientY;
+        touchHadSelection = nativeSelectionActive();
+        gestureDecided = false;
+        isScrollGesture = false;
+    }, { passive: true });
+
+    document.addEventListener('touchmove', (e) => {
+        if (e.touches.length !== 1) return; // Allow pinch zoom if not handled by CSS
+        var x = e.touches[0].clientX;
+        var y = e.touches[0].clientY;
+        if (!gestureDecided) {
+            if (Math.abs(x - touchStartX) < TOUCH_SLOP && Math.abs(y - touchStartY) < TOUCH_SLOP) {
+                return;
+            }
+            gestureDecided = true;
+            if (!touchHadSelection && nativeSelectionActive()) {
+                // A long-press selection engaged during this touch: let the
+                // browser keep the stream for selection dragging.
+                isScrollGesture = false;
+                return;
+            }
+            isScrollGesture = true;
+        }
+        if (isScrollGesture) {
+            // Claim the gesture before the browser can classify it as a text
+            // selection drag. xterm's bubble-phase touchmove handler on
+            // #terminal still receives this event and does the scrolling.
+            e.preventDefault();
+            touchSamples.push({ y: y, t: e.timeStamp });
+            while (touchSamples.length > 2 && e.timeStamp - touchSamples[0].t > FLING_SAMPLE_MS) {
+                touchSamples.shift();
+            }
+        }
+    }, { passive: false });
+
+    var resetTouchGesture = function () {
+        gestureDecided = false;
+        isScrollGesture = false;
+        touchSamples = [];
+    };
+
+    document.addEventListener('touchend', () => {
+        // Fling on release, using the velocity of the last ~100ms of dragging.
+        // Finger up (y decreases) → (first.y - last.y) > 0 → scroll down.
+        if (isScrollGesture && touchSamples.length > 1) {
+            var first = touchSamples[0];
+            var last = touchSamples[touchSamples.length - 1];
+            if (last.t > first.t) {
+                var v = (first.y - last.y) / (last.t - first.t);
+                v = Math.max(-FLING_MAX_VELOCITY, Math.min(FLING_MAX_VELOCITY, v));
+                if (Math.abs(v) > FLING_MIN_VELOCITY) {
+                    startFling(v);
+                }
+            }
+        }
+        resetTouchGesture();
+    }, { passive: true });
+    document.addEventListener('touchcancel', resetTouchGesture, { passive: true });
+
+    // --- EVENT SHIELD: Force Native Context Menu (Global Capture) ---
+    // This listener runs in the CAPTURE phase on the DOCUMENT.
+    // It intercepts the 'contextmenu' event BEFORE it reaches xterm.js.
+    // We stop it from propagating to xterm, but allow the default browser behavior (menu).
+
+    document.addEventListener('contextmenu', (e) => {
+        // Only intercept if inside the terminal
+        if (e.target.closest('#terminal')) {
+            e.stopImmediatePropagation(); // Kill it before xterm sees it
+            // e.preventDefault(); // DO NOT CALL THIS! We want the menu!
+            return true;
+        }
+    }, true); // true = Capture Phase
+
+    console.log("Global ContextMenu Interceptor activated");
+}
+
+// Fix for mouse/touch coordinates when the terminal is visually flipped
+function setupMirroredInputFix(termEl) {
+    const fixEvent = (e) => {
+        if (!termEl.classList.contains('webgl-mobile-fix')) return;
+
+        // If the event was already fixed, skip
+        if (e._fixed) return;
+
+        const rect = termEl.getBoundingClientRect();
+        let clientY = e.clientY;
+        if (e.touches && e.touches.length > 0) {
+            clientY = e.touches[0].clientY;
+        }
+
+        // Calculate relative Y and flip it
+        const relativeY = clientY - rect.top;
+        const flippedY = rect.height - relativeY;
+        const newClientY = rect.top + flippedY;
+
+        // We can't easily modify clientY of a native event, 
+        // but xterm.js uses offsetX/offsetY or calculates from clientX/Y.
+        // This is a complex area. A simpler way is to use a proxy element or 
+        // just warn the user that touch selection might be inverted.
+        console.log("Input coordinates might need inversion due to WebGL fix");
+    };
+
+    // termEl.addEventListener('mousedown', fixEvent, true);
+    // termEl.addEventListener('touchstart', fixEvent, true);
+}
+
+// --- Implementation of exports matching term.js.bak ---
+
+// exports.write(data) - Write data from VM to terminal
+exports.write = (data, applicationMode) => {
+    // legacy hterm code imply data is Binary String (UTF-8/Latin1 bytes)
+    try {
+        const uint8 = strToUint8Array(data);
+        term.write(uint8);
+        if (term.modes.applicationCursorKeysMode !== applicationMode) {
+            native.setApplicationMode(term.modes.applicationCursorKeysMode)
+        }
+    } catch (e) {
+        console.error("exports.write failed", e);
+    }
+};
+
+exports.writeBase64 = (base64Data, applicationMode) => {
+    try {
+        let binaryString = atob(base64Data);
+
+        // 兼容性修复：还原字面量转义序列 (Unescape)
+        // 支持 \xHH, \uHHHH, 以及常见 C 风格转义符 (\n, \r, \t, \', \", \\)
+        binaryString = binaryString.replace(/\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)/g, (match, param) => {
+            if (param[0] === 'x' || param[0] === 'u') {
+                return String.fromCharCode(parseInt(param.slice(1), 16));
+            }
+            switch (param) {
+                case 'n': return '\n';
+                case 'r': return '\r';
+                case 't': return '\t';
+                case 'b': return '\b';
+                case 'f': return '\f';
+                case 'v': return '\v';
+                case '0': return '\0';
+                default: return param; // For \' \" \\ and others, just return the char
+            }
+        });
+
+        const uint8 = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            uint8[i] = binaryString.charCodeAt(i);
+        }
+        term.write(uint8);
+
+        // Sync Application Cursor Mode using xterm.js state
+        if (term.modes.applicationCursorKeysMode !== applicationMode) {
+            if (native && native.setApplicationMode) {
+                native.setApplicationMode(term.modes.applicationCursorKeysMode);
+            }
+        }
+    } catch (e) {
+        console.error("exports.writeBase64 failed", e);
+    }
+};
+
+exports.paste = (data) => {
+    if (native && native.sendInput) {
+        // If data is already binary string (UTF-8 bytes as chars), just send it.
+        native.sendInput(data);
+    }
+};
+
+exports.copy = () => {
+    // xmm.js selection API
+    return term.getSelection();
+};
+
+exports.setFontSize = (size) => {
+    term.options.fontSize = size;
+    fitAddon.fit();
+};
+
+exports.setFontFamily = (family) => {
+    currentFontFamily = family || 'Default';
+    var newFamily = mapFontFamily(family);
+    term.options.fontFamily = newFamily;
+
+    // Resize to current dimensions to force xterm.js to
+    // re-layout with the new font metrics, then re-fit.
+    if (term.cols > 0 && term.rows > 0) {
+        term.resize(term.cols, term.rows);
+    }
+    fitAddon.fit();
+};
+
+exports.setCursorShape = (shape) => {
+    // hterm: BLOCK, BEAM, UNDERLINE
+    // xterm: block, bar, underline
+    switch (shape) {
+        case 'BEAM': term.options.cursorStyle = 'bar'; break;
+        case 'UNDERLINE': term.options.cursorStyle = 'underline'; break;
+        default: term.options.cursorStyle = 'block'; break;
+    }
+};
+
+exports.setCursorBlink = (blink) => {
+    term.options.cursorBlink = blink;
+};
+
+// Ligature / italic toggles: this build always uses the DOM renderer,
+// so both are pure CSS switches applied live without reloading.
+exports.setLigatures = (enabled) => {
+    document.body.classList.toggle('ligatures-off', !enabled);
+};
+
+exports.setItalic = (enabled) => {
+    document.body.classList.toggle('italics-off', !enabled);
+};
+
+// --- Terminal appearance: background color / image / gaussian blur ---
+
+exports.setBackgroundColor = (color) => {
+    if (!color) return;
+    document.body.style.backgroundColor = color;
+};
+
+exports.setBackgroundImage = (dataUrl) => {
+    var bg = document.getElementById('terminal-bg');
+    if (!bg) return;
+    bg.style.backgroundImage = dataUrl ? 'url("' + dataUrl + '")' : 'none';
+};
+
+exports.setBackgroundBlur = (px) => {
+    var bg = document.getElementById('terminal-bg');
+    if (!bg) return;
+    var radius = parseInt(px, 10) || 0;
+    if (radius > 0) {
+        bg.style.filter = 'blur(' + radius + 'px)';
+        // Slightly upscale so the blurred edges stay covered
+        bg.style.transform = 'scale(' + (1 + radius / 100) + ')';
+    } else {
+        bg.style.filter = 'none';
+        bg.style.transform = 'none';
+    }
+};
+
+// Registers a user-uploaded font into the document via the FontFace API.
+// dataUrl is a base64 data URL of the font file (ttf/otf/woff/woff2).
+exports.addUserFont = (name, dataUrl) => {
+    if (!name || !dataUrl || typeof FontFace === 'undefined') return;
+    try {
+        var face = new FontFace(name, 'url("' + dataUrl + '")');
+        face.load().then(function (loaded) {
+            document.fonts.add(loaded);
+            console.log('User font loaded: ' + name);
+            // Re-apply in case this font is the currently selected one
+            if (currentFontFamily === name) {
+                exports.setFontFamily(name);
+            }
+        }).catch(function (e) {
+            console.error('User font load failed: ' + name, e);
+        });
+    } catch (e) {
+        console.error('addUserFont failed: ' + name, e);
+    }
+};
+
+exports.setFocused = (focus) => {
+    if (focus) {
+        setupImeGuard();
+        term.focus();
+    } else {
+        term.blur();
+    }
+};
+
+// Mock hterm.openUrl for compatibility if something calls it directly
+window.hterm = {
+    openUrl: (url) => {
+        if (native && native.openLink) native.openLink(url);
+    }
+};
+
+exports.selectAll = () => {
+    term.selectAll();
+};
+
+// Clears the whole terminal buffer (viewport + scrollback)
+exports.clearScreen = () => {
+    term.clear();
+};

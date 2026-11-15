@@ -1,0 +1,56 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Swai 个人智能体核心模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Swai 个人智能体"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Swai"
+    },
+    {
+      "name": "service_desc",
+      "value": "向其他应用提供智能体系统执行与命令通道"
+    },
+    {
+      "name": "service_label",
+      "value": "Swai 智能服务"
+    },
+    {
+      "name": "permission_use_shell_label",
+      "value": "使用系统执行通道"
+    },
+    {
+      "name": "permission_use_shell_desc",
+      "value": "允许通过 Swai 在设备上执行系统级自动化任务。"
+    },
+    {
+      "name": "permission_internet",
+      "value": "用于连接智能体服务与大模型"
+    },
+    {
+      "name": "permission_network_info",
+      "value": "用于获取设备网络状态"
+    },
+    {
+      "name": "permission_background",
+      "value": "用于在后台保持智能体通道可用"
+    },
+    {
+      "name": "permission_download_desc",
+      "value": "用于将智能体生成的文件保存至系统公共下载目录"
+    },
+    {
+      "name": "permission_documents_desc",
+      "value": "用于将智能体生成的文件保存至系统公共文档目录"
+    },
+    {
+      "name": "permission_float_window_desc",
+      "value": "用于在跨应用自动化执行时展示智能体状态与实时思考悬浮窗"
+    }
+  ]
+}

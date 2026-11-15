@@ -1,0 +1,51 @@
+# Build output & caches
+build/
+**/build/
+.cxx/
+**/.cxx/
+.preview/
+**/.preview/
+.test/
+**/.test/
+oh_modules/
+**/oh_modules/
+node_modules/
+**/node_modules/
+*.o
+*.hap
+*.hsp
+*.har
+*.cache
+*.msgpack
+*.protoBin
+
+# IDE & Tooling
+.idea/
+.hvigor/
+**/.hvigor/
+local.properties
+oh-package-lock.json5
+build-profile.json5.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary & Local Agent State
+.wechat-agent/
+.agents/
+*.log
+*.tmp
+task_plan.md
+findings.md
+progress.md
+shuweihshell/
+
+# Signing credentials
+*.cer
+*.p12
+*.p7b
+*.csr
+
+# Specifications
+docs/superpowers/

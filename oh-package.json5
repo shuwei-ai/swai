@@ -1,0 +1,10 @@
+{
+  "modelVersion": "6.1.1",
+  "name": "swai",
+  "version": "1.0.0",
+  "description": "Swai - Next-Gen Personal AI Agent for HarmonyOS NEXT",
+  "main": "",
+  "author": "枢维智能",
+  "license": "Apache-2.0",
+  "dependencies": {}
+}
