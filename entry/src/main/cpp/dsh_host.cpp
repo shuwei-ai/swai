@@ -240,9 +240,12 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
 
         if (!options.workspace_root.empty()) {
             mkdir(options.workspace_root.c_str(), 0777);
+            chmod(options.workspace_root.c_str(), 0777);
             std::string dsh_dir = options.workspace_root + "/.dsh";
             mkdir(dsh_dir.c_str(), 0777);
+            chmod(dsh_dir.c_str(), 0777);
             chdir(options.workspace_root.c_str());
+            umask(0);
 
             setenv("HOME", options.workspace_root.c_str(), 1);
             setenv("DSH_HOME", dsh_dir.c_str(), 1);
@@ -288,6 +291,7 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "const logFile = path.join(home, 'stderr.log');\n"
                 "const outLogFile = path.join(home, 'stdout.log');\n"
                 "const readyFile = path.join(home, 'ready.json');\n"
+                "try { fs.chmodSync(home, 0o777); } catch(e){}\n"
                 "function writeLog(prefix, msg) {\n"
                 "  try { fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${prefix}: ${msg}\\n`); } catch(e){}\n"
                 "}\n"
@@ -385,7 +389,12 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "try {\n"
                 "  const origStderrWrite = process.stderr.write.bind(process.stderr);\n"
                 "  process.stderr.write = function(chunk, encoding, cb) {\n"
-                "    try { fs.appendFileSync(logFile, chunk); } catch(e){}\n"
+                "    try {\n"
+                "      const str = chunk.toString();\n"
+                "      if (!str.startsWith('[../../arkweb/') && !str.startsWith('[../../content/') && !str.startsWith('[../../cef/') && !str.startsWith('[../../ohos_nweb/') && !str.startsWith('[../../media/') && !str.startsWith('[../../net/')) {\n"
+                "        fs.appendFileSync(logFile, chunk);\n"
+                "      }\n"
+                "    } catch(e){}\n"
                 "    return origStderrWrite(chunk, encoding, cb);\n"
                 "  };\n"
                 "} catch(e) {}\n"
@@ -471,7 +480,35 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "      throw err;\n"
                 "    }\n"
                 "  };\n"
-                "} catch(e) { writeLog('PRELOAD_LINK_ERR', 'link shim: ' + e); }\n"
+                "  const origFspChmod = fsp.chmod;\n"
+                "  fsp.chmod = async function(path, mode) {\n"
+                "    try { return await origFspChmod.call(this, path, mode); } catch(err) {\n"
+                "      if (err && (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'ENOSYS')) return;\n"
+                "      throw err;\n"
+                "    }\n"
+                "  };\n"
+                "  const origFsChmodSync = fs.chmodSync;\n"
+                "  fs.chmodSync = function(path, mode) {\n"
+                "    try { return origFsChmodSync.call(this, path, mode); } catch(err) {\n"
+                "      if (err && (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'ENOSYS')) return;\n"
+                "      throw err;\n"
+                "    }\n"
+                "  };\n"
+                "  const origFspOpen = fsp.open;\n"
+                "  fsp.open = async function(...args) {\n"
+                "    const h = await origFspOpen.apply(this, args);\n"
+                "    if (h && typeof h.chmod === 'function') {\n"
+                "      const origHChmod = h.chmod.bind(h);\n"
+                "      h.chmod = async function(...cargs) {\n"
+                "        try { return await origHChmod.apply(this, cargs); } catch(err) {\n"
+                "          if (err && (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'ENOSYS')) return;\n"
+                "          throw err;\n"
+                "        }\n"
+                "      };\n"
+                "    }\n"
+                "    return h;\n"
+                "  };\n"
+                "} catch(e) { writeLog('PRELOAD_LINK_ERR', 'link/chmod shim: ' + e); }\n"
                 "const origExit = process.exit;\n"
                 "process.exit = function(code) {\n"
                 "  const st = new Error().stack;\n"
@@ -502,6 +539,11 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "      fullCmd = actualArgs.slice(1).join(' ');\n"
                 "    } else if (actualArgs.length > 0) {\n"
                 "      fullCmd = `${command} ${actualArgs.join(' ')}`;\n"
+                "    }\n"
+                "    const targetCwd = options && options.cwd ? options.cwd : (process.env.HOME || process.cwd());\n"
+                "    let effectiveCmd = fullCmd.trim();\n"
+                "    if (targetCwd && !effectiveCmd.startsWith('cd ') && !effectiveCmd.startsWith('cd/')) {\n"
+                "      effectiveCmd = `cd ${JSON.stringify(targetCwd)} && ${effectiveCmd}`;\n"
                 "    }\n"
                 "    const child = new EventEmitter();\n"
                 "    const pid = Math.floor(Math.random() * 20000) + 10000;\n"
@@ -534,7 +576,7 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "      const reqData = JSON.stringify({\n"
                 "        requestId: `dsh-cp-${Date.now()}-${pid}`,\n"
                 "        tool: 'bash',\n"
-                "        args: { command: fullCmd },\n"
+                "        args: { command: effectiveCmd },\n"
                 "        deadlineMs: Date.now() + 60000\n"
                 "      });\n"
                 "      req = http.request({\n"

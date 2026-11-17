@@ -38,6 +38,8 @@ export class AgentWorkspace {
     }
     this.ensureDir(this.workspaceRoot);
     hilog.info(DOMAIN, TAG, 'AgentWorkspace initialized at %{public}s', this.workspaceRoot);
+    // Cleanup any duplicate stray workspace/workspace dirs and rescue files
+    this.cleanupDuplicateWorkspaceDirs();
     // Proactively grant public directory permissions in background
     this.ensurePermissionsSilently();
     // Ensure CPython 3.13 standard library zip is deployed
@@ -310,6 +312,11 @@ export class AgentWorkspace {
       }
     }
 
+    // Paths referring to workspace directly
+    if (trimmed.startsWith('/workspace/') || trimmed === '/workspace') {
+      return true;
+    }
+
     // Standard OpenHarmony application sandbox mount points
     if (trimmed.startsWith('/data/storage/el2/') ||
         trimmed.startsWith('/data/storage/el1/') ||
@@ -509,14 +516,81 @@ export class AgentWorkspace {
    * Resolves relative paths into absolute workspace paths and normalizes directory segments.
    */
   resolvePath(rawPath: string): string {
-    const trimmed = rawPath.trim();
+    let trimmed = rawPath.trim();
     if (this.isPublicPath(trimmed)) {
       return this.resolvePublicPath(trimmed);
     }
     if (trimmed.startsWith('/')) {
+      if (trimmed.startsWith('/workspace/')) {
+        trimmed = trimmed.substring('/workspace/'.length);
+        return this.normalizePath(`${this.workspaceRoot}/${trimmed}`);
+      } else if (trimmed === '/workspace') {
+        return this.workspaceRoot;
+      }
       return this.normalizePath(trimmed);
     }
+    if (trimmed.startsWith('workspace/')) {
+      trimmed = trimmed.substring('workspace/'.length);
+    } else if (trimmed.startsWith('./workspace/')) {
+      trimmed = trimmed.substring('./workspace/'.length);
+    } else if (trimmed === 'workspace' || trimmed === './workspace') {
+      return this.workspaceRoot;
+    }
     return this.normalizePath(`${this.workspaceRoot}/${trimmed}`);
+  }
+
+  /**
+   * Rescues any files trapped in duplicate nested workspace directories (e.g. 'workspace/workspace' or 'workspace/workspace ')
+   * by moving them up to this.workspaceRoot, and removes the stray directories.
+   */
+  cleanupDuplicateWorkspaceDirs(): void {
+    try {
+      const candidates: string[] = [`${this.workspaceRoot}/workspace `, `${this.workspaceRoot}/workspace`];
+      for (let i = 0; i < candidates.length; i++) {
+        const badDir = candidates[i];
+        try {
+          if (fs.accessSync(badDir)) {
+            const stat = fs.statSync(badDir);
+            if (stat.isDirectory()) {
+              const files = fs.listFileSync(badDir);
+              for (let j = 0; j < files.length; j++) {
+                const f = files[j];
+                const src = `${badDir}/${f}`;
+                const dst = `${this.workspaceRoot}/${f}`;
+                try {
+                  const srcStat = fs.statSync(src);
+                  if (srcStat.isDirectory()) {
+                    this.ensureDir(dst);
+                    const subFiles = fs.listFileSync(src);
+                    for (let k = 0; k < subFiles.length; k++) {
+                      const sf = subFiles[k];
+                      try {
+                        fs.copyFileSync(`${src}/${sf}`, `${dst}/${sf}`);
+                      } catch (_e) {}
+                    }
+                  } else {
+                    if (!fs.accessSync(dst)) {
+                      fs.copyFileSync(src, dst);
+                      hilog.info(DOMAIN, TAG, 'Migrated stray file %{public}s to %{public}s', src, dst);
+                    }
+                  }
+                } catch (_cpErr) {
+                  hilog.warn(DOMAIN, TAG, 'Failed to migrate %{public}s: %{public}s', src, `${_cpErr}`);
+                }
+              }
+              try {
+                fs.rmdirSync(badDir);
+                hilog.info(DOMAIN, TAG, 'Removed stray duplicate directory %{public}s', badDir);
+              } catch (_rmErr) {
+                // If not empty, ignore
+              }
+            }
+          }
+        } catch (_accErr) {}
+      }
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'cleanupDuplicateWorkspaceDirs failed: %{public}s', `${err}`);
+    }
   }
 
   /**

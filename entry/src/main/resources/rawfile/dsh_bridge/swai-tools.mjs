@@ -44,11 +44,19 @@ export function apply(ctx) {
       y: { type: 'number', description: 'Y screen coordinate' },
       content: { type: 'string', description: 'Text content to type (supports Chinese)' },
       direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Swipe direction' },
-      steps: { type: 'array', description: 'Ordered step objects for run_sequence' }
+      steps: {
+        type: 'array',
+        description: 'Ordered step objects for run_sequence',
+        items: {
+          type: 'object',
+          additionalProperties: true
+        }
+      }
     },
     output: {
       schema: {
         type: 'object',
+        additionalProperties: false,
         properties: {
           text: { type: 'string' }
         }
@@ -76,6 +84,7 @@ export function apply(ctx) {
     output: {
       schema: {
         type: 'object',
+        additionalProperties: false,
         properties: {
           text: { type: 'string' }
         }
@@ -86,7 +95,11 @@ export function apply(ctx) {
       }]
     },
     async execute(args) {
-      const res = await dispatchSwaiTool('bash', args, ((args.timeout || 30) + 5) * 1000);
+      const cwd = process.cwd();
+      const rawCmd = (args.command || '').trim();
+      const cmd = (rawCmd.startsWith('cd ') || rawCmd.startsWith('cd/')) ? rawCmd : `cd ${JSON.stringify(cwd)} && ${rawCmd}`;
+      const payload = { ...args, command: cmd };
+      const res = await dispatchSwaiTool('bash', payload, ((args.timeout || 30) + 5) * 1000);
       return { text: res.ok ? res.output : `Exit ${res.exitCode}: ${res.error || res.output}` };
     }
   }));
@@ -104,6 +117,7 @@ export function apply(ctx) {
     output: {
       schema: {
         type: 'object',
+        additionalProperties: false,
         properties: {
           text: { type: 'string' }
         }
@@ -131,6 +145,7 @@ export function apply(ctx) {
     output: {
       schema: {
         type: 'object',
+        additionalProperties: false,
         properties: {
           text: { type: 'string' }
         }
@@ -173,6 +188,7 @@ export function apply(ctx) {
     output: {
       schema: {
         type: 'object',
+        additionalProperties: false,
         properties: {
           text: { type: 'string' }
         }
