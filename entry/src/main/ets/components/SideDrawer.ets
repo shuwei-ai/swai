@@ -1,7 +1,7 @@
 /*
  * SideDrawer: Clean & Minimalist Navigation Drawer (Mika Inspired).
  * Retains core navigation modules + Mika-style Footer (About on left, GitHub repo on right):
- * 1. App Header (✦ Swai with live status)
+ * 1. App Header (Swai Logo with live status)
  * 2. Swai 智能体
  * 3. Shell 终端
  * 4. 浏览器
@@ -47,18 +47,12 @@ export struct SideDrawer {
         // App Header Section
         Row() {
           // App Logo
-          Row() {
-            Text('✦')
-              .fontSize(18)
-              .fontColor('#38bdf8')
-          }
-          .width(38)
-          .height(38)
-          .backgroundColor('#0f172a')
-          .borderRadius(10)
-          .justifyContent(FlexAlign.Center)
-          .alignItems(VerticalAlign.Center)
-          .margin({ right: 10 })
+          Image($r('app.media.startIcon'))
+            .width(38)
+            .height(38)
+            .borderRadius(10)
+            .shadow({ radius: 8, color: 'rgba(0,0,0,0.08)', offsetY: 2 })
+            .margin({ right: 10 })
 
           Column({ space: 3 }) {
             Text('Swai')
