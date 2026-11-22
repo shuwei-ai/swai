@@ -148,168 +148,163 @@ export struct BrowserFloatingPip {
   }
 
   build() {
-    Stack({ alignContent: Alignment.TopStart }) {
-      Column() {
-        // 1. Pip Header (Drag Handle & Controls)
-        Row() {
-          // Drag indicator and page icon
-          Row({ space: 5 }) {
-            Text('⋮⋮')
-              .fontSize(11)
-              .fontColor('#94a3b8')
-              .fontWeight(FontWeight.Bold)
+    Column() {
+      // 1. Pip Header (Drag Handle & Controls)
+      Row() {
+        // Drag indicator and page icon
+        Row({ space: 5 }) {
+          Text('⋮⋮')
+            .fontSize(11)
+            .fontColor('#94a3b8')
+            .fontWeight(FontWeight.Bold)
 
-            Text('🌐')
-              .fontSize(12)
+          Text('🌐')
+            .fontSize(12)
 
-            Text(this.browserManager.currentTitle || '网页视口')
-              .fontSize(11)
-              .fontWeight(FontWeight.Medium)
-              .fontColor('#0f172a')
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .layoutWeight(1)
+          Text(this.browserManager.currentTitle || '网页视口')
+            .fontSize(11)
+            .fontWeight(FontWeight.Medium)
+            .fontColor('#0f172a')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
 
-            // Running / Attention indicator dot
-            Circle({ width: 7, height: 7 })
-              .fill(this.glowStatus === PipGlowStatus.RUNNING ? '#22c55e' :
-                    this.glowStatus === PipGlowStatus.ATTENTION ? '#f59e0b' : '#38bdf8')
-              .opacity(this.attentionAlpha)
-          }
-          .layoutWeight(1)
-          .alignItems(VerticalAlign.Center)
-
-          // Mode Toggle (Mini <-> Expanded)
-          Button({ type: ButtonType.Circle }) {
-            Text(this.pipMode === PipMode.EXPANDED ? '—' : '⤢')
-              .fontSize(12)
-              .fontColor('#475569')
-              .fontWeight(FontWeight.Bold)
-          }
-          .width(22)
-          .height(22)
-          .backgroundColor('#f1f5f9')
-          .margin({ right: 6 })
-          .onClick(() => {
-            if (this.pipMode === PipMode.EXPANDED) {
-              this.pipState.showMini();
-              this.snapToEdge(this.posX, this.posY);
-            } else {
-              this.pipState.showExpanded();
-              this.snapToEdge(this.posX, this.posY);
-            }
-          })
-
-          // Close Button (×)
-          Button({ type: ButtonType.Circle }) {
-            Text('×')
-              .fontSize(14)
-              .fontColor('#64748b')
-              .fontWeight(FontWeight.Bold)
-          }
-          .width(22)
-          .height(22)
-          .backgroundColor('#f1f5f9')
-          .onClick(() => {
-            this.pipState.hide();
-            promptAction.showToast({ message: '浮窗已收起，可在侧栏「浏览器」再次查看', duration: 1500 });
-          })
-        }
-        .width('100%')
-        .height(34)
-        .padding({ left: 8, right: 8 })
-        .backgroundColor('#ffffff')
-        .border({ width: { bottom: 1 }, color: '#f1f5f9' })
-        .alignItems(VerticalAlign.Center)
-        .gesture(
-          PanGesture({ fingers: 1, direction: PanDirection.All })
-            .onActionStart(() => {
-              this.isDragging = true;
-              this.startPosX = this.posX;
-              this.startPosY = this.posY;
-            })
-            .onActionUpdate((event?: GestureEvent) => {
-              if (event) {
-                const width = this.getWindowWidth();
-                const height = this.getWindowHeight();
-                const minX = 0;
-                const maxX = Math.max(0, this.screenWidthVp - width);
-                const minY = 40;
-                const maxY = Math.max(minY, this.screenHeightVp - height - 40);
-
-                const nextX = this.startPosX + event.offsetX;
-                const nextY = this.startPosY + event.offsetY;
-
-                this.posX = Math.max(minX, Math.min(maxX, nextX));
-                this.posY = Math.max(minY, Math.min(maxY, nextY));
-              }
-            })
-            .onActionEnd(() => {
-              this.isDragging = false;
-              this.snapToEdge(this.posX, this.posY);
-            })
-            .onActionCancel(() => {
-              this.isDragging = false;
-              this.snapToEdge(this.posX, this.posY);
-            })
-        )
-
-        // 2. Viewport Content (Always mounted to preserve Webview & CDP 9222)
-        Stack({ alignContent: Alignment.Bottom }) {
-          BrowserView({
-            onHide: () => {
-              this.pipState.hide();
-            }
-          })
-          .layoutWeight(1)
-          .width('100%')
-
-          if (this.pipMode === PipMode.MINI) {
-            Row() {
-              Text('轻触放大 ⤢')
-                .fontSize(10)
-                .fontColor('#ffffff')
-                .fontWeight(FontWeight.Medium)
-            }
-            .width('100%')
-            .height(24)
-            .backgroundColor('rgba(15, 23, 42, 0.65)')
-            .justifyContent(FlexAlign.Center)
-            .alignItems(VerticalAlign.Center)
-            .onClick(() => {
-              this.pipState.showExpanded();
-              this.snapToEdge(this.posX, this.posY);
-            })
-          }
+          // Running / Attention indicator dot
+          Circle({ width: 7, height: 7 })
+            .fill(this.glowStatus === PipGlowStatus.RUNNING ? '#22c55e' :
+                  this.glowStatus === PipGlowStatus.ATTENTION ? '#f59e0b' : '#38bdf8')
+            .opacity(this.attentionAlpha)
         }
         .layoutWeight(1)
-        .width('100%')
+        .alignItems(VerticalAlign.Center)
+
+        // Mode Toggle (Mini <-> Expanded)
+        Button({ type: ButtonType.Circle }) {
+          Text(this.pipMode === PipMode.EXPANDED ? '—' : '⤢')
+            .fontSize(12)
+            .fontColor('#475569')
+            .fontWeight(FontWeight.Bold)
+        }
+        .width(22)
+        .height(22)
+        .backgroundColor('#f1f5f9')
+        .margin({ right: 6 })
+        .onClick(() => {
+          if (this.pipMode === PipMode.EXPANDED) {
+            this.pipState.showMini();
+            this.snapToEdge(this.posX, this.posY);
+          } else {
+            this.pipState.showExpanded();
+            this.snapToEdge(this.posX, this.posY);
+          }
+        })
+
+        // Close Button (×)
+        Button({ type: ButtonType.Circle }) {
+          Text('×')
+            .fontSize(14)
+            .fontColor('#64748b')
+            .fontWeight(FontWeight.Bold)
+        }
+        .width(22)
+        .height(22)
+        .backgroundColor('#f1f5f9')
+        .onClick(() => {
+          this.pipState.hide();
+          promptAction.showToast({ message: '浮窗已收起，可在侧栏「浏览器」再次查看', duration: 1500 });
+        })
       }
-      .width(this.getWindowWidth())
-      .height(this.getWindowHeight())
+      .width('100%')
+      .height(34)
+      .padding({ left: 8, right: 8 })
       .backgroundColor('#ffffff')
-      .borderRadius(14)
-      .border({
-        width: this.glowStatus !== PipGlowStatus.NORMAL ? 2.5 : 1.5,
-        color: this.getBorderColor()
-      })
-      .shadow({
-        radius: this.glowStatus === PipGlowStatus.ATTENTION ? 20 : 12,
-        color: this.glowStatus === PipGlowStatus.ATTENTION ? 'rgba(245, 158, 11, 0.35)' :
-               this.glowStatus === PipGlowStatus.RUNNING ? 'rgba(34, 197, 94, 0.3)' : 'rgba(0, 0, 0, 0.16)',
-        offsetX: 0,
-        offsetY: 4
-      })
-      .clip(true)
-      .position({
-        x: this.pipMode !== PipMode.HIDDEN ? this.posX : -4000,
-        y: this.pipMode !== PipMode.HIDDEN ? this.posY : -4000
-      })
-      .opacity(this.pipMode !== PipMode.HIDDEN ? 1 : 0.001)
-      .hitTestBehavior(this.pipMode !== PipMode.HIDDEN ? HitTestMode.Default : HitTestMode.None)
+      .border({ width: { bottom: 1 }, color: '#f1f5f9' })
+      .alignItems(VerticalAlign.Center)
+      .priorityGesture(
+        PanGesture({ fingers: 1, direction: PanDirection.All })
+          .onActionStart(() => {
+            this.isDragging = true;
+            this.startPosX = this.posX;
+            this.startPosY = this.posY;
+          })
+          .onActionUpdate((event?: GestureEvent) => {
+            if (event) {
+              const width = this.getWindowWidth();
+              const height = this.getWindowHeight();
+              const minX = 0;
+              const maxX = Math.max(0, this.screenWidthVp - width);
+              const minY = 40;
+              const maxY = Math.max(minY, this.screenHeightVp - height - 40);
+
+              const nextX = this.startPosX + event.offsetX;
+              const nextY = this.startPosY + event.offsetY;
+
+              this.posX = Math.max(minX, Math.min(maxX, nextX));
+              this.posY = Math.max(minY, Math.min(maxY, nextY));
+            }
+          })
+          .onActionEnd(() => {
+            this.isDragging = false;
+            this.snapToEdge(this.posX, this.posY);
+          })
+          .onActionCancel(() => {
+            this.isDragging = false;
+            this.snapToEdge(this.posX, this.posY);
+          })
+      )
+
+      // 2. Viewport Content (Always mounted to preserve Webview & CDP 9222)
+      Stack({ alignContent: Alignment.Bottom }) {
+        BrowserView({
+          onHide: () => {
+            this.pipState.hide();
+          }
+        })
+        .layoutWeight(1)
+        .width('100%')
+
+        if (this.pipMode === PipMode.MINI) {
+          Row() {
+            Text('轻触放大 ⤢')
+              .fontSize(10)
+              .fontColor('#ffffff')
+              .fontWeight(FontWeight.Medium)
+          }
+          .width('100%')
+          .height(24)
+          .backgroundColor('rgba(15, 23, 42, 0.65)')
+          .justifyContent(FlexAlign.Center)
+          .alignItems(VerticalAlign.Center)
+          .onClick(() => {
+            this.pipState.showExpanded();
+            this.snapToEdge(this.posX, this.posY);
+          })
+        }
+      }
+      .layoutWeight(1)
+      .width('100%')
     }
-    .width('100%')
-    .height('100%')
-    .hitTestBehavior(this.pipMode !== PipMode.HIDDEN ? HitTestMode.Transparent : HitTestMode.None)
+    .width(this.getWindowWidth())
+    .height(this.getWindowHeight())
+    .backgroundColor('#ffffff')
+    .borderRadius(14)
+    .border({
+      width: this.glowStatus !== PipGlowStatus.NORMAL ? 2.5 : 1.5,
+      color: this.getBorderColor()
+    })
+    .shadow({
+      radius: this.glowStatus === PipGlowStatus.ATTENTION ? 20 : 12,
+      color: this.glowStatus === PipGlowStatus.ATTENTION ? 'rgba(245, 158, 11, 0.35)' :
+             this.glowStatus === PipGlowStatus.RUNNING ? 'rgba(34, 197, 94, 0.3)' : 'rgba(0, 0, 0, 0.16)',
+      offsetX: 0,
+      offsetY: 4
+    })
+    .clip(true)
+    .position({
+      x: this.pipMode !== PipMode.HIDDEN ? this.posX : -4000,
+      y: this.pipMode !== PipMode.HIDDEN ? this.posY : -4000
+    })
+    .opacity(this.pipMode !== PipMode.HIDDEN ? 1 : 0.001)
+    .hitTestBehavior(this.pipMode !== PipMode.HIDDEN ? HitTestMode.Default : HitTestMode.None)
   }
 }
