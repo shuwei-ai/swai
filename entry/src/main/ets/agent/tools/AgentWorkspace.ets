@@ -209,6 +209,9 @@ export class AgentWorkspace {
       // ignore
     }
 
+    // Always enforce window.open shim in dsh-web-frontend/dist/index.html to prevent white screen on login
+    this.patchDshIndexHtml(runtimeDir);
+
     try {
       if (fs.accessSync(binJs)) {
         return runtimeDir;
@@ -241,6 +244,7 @@ export class AgentWorkspace {
 
       await zlib.decompressFile(zipDest, runtimeDir);
       hilog.info(DOMAIN, TAG, 'dsh-runtime decompressed successfully to %{public}s', runtimeDir);
+      this.patchDshIndexHtml(runtimeDir);
       try {
         fs.unlinkSync(zipDest);
       } catch (_u) {}
@@ -248,6 +252,116 @@ export class AgentWorkspace {
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'ensureDshRuntime failed: %{public}s', `${err}`);
       return '';
+    }
+  }
+
+  /**
+   * Patches dsh-web-frontend/dist/index.html to hook window.open and clipboard.
+   * This prevents blank screen caused by window.open("about:blank") during login,
+   * and routes OAuth login URLs into Swai's built-in browser (BrowserManager).
+   */
+  private patchDshIndexHtml(runtimeDir: string): void {
+    try {
+      const indexHtmlPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html`;
+      if (fs.accessSync(indexHtmlPath)) {
+        let html = fs.readTextSync(indexHtmlPath);
+        if (!html.includes('swai-window-open-shim')) {
+          const shim = `<script id="swai-window-open-shim">
+(function() {
+  function openExternal(url) {
+    if (!url || url === 'about:blank') return;
+    if (window.swaiBridge && typeof window.swaiBridge.openUrl === 'function') {
+      window.swaiBridge.openUrl(url);
+    } else {
+      var retries = 0;
+      var t = setInterval(function() {
+        retries++;
+        if (window.swaiBridge && typeof window.swaiBridge.openUrl === 'function') {
+          clearInterval(t);
+          window.swaiBridge.openUrl(url);
+        } else if (retries > 30) {
+          clearInterval(t);
+        }
+      }, 100);
+    }
+  }
+  var origOpen = window.open;
+  window.open = function(url, target, features) {
+    console.log('[SwaiShim] window.open intercepted:', url, target);
+    var dummy = {
+      closed: false,
+      opener: null,
+      location: {
+        _href: url || '',
+        replace: function(newUrl) {
+          console.log('[SwaiShim] dummy.location.replace:', newUrl);
+          dummy.location._href = newUrl;
+          openExternal(newUrl);
+        },
+        assign: function(newUrl) { dummy.location.replace(newUrl); },
+        reload: function() {},
+        get href() { return dummy.location._href; },
+        set href(newUrl) { dummy.location.replace(newUrl); },
+        toString: function() { return dummy.location._href; }
+      },
+      close: function() { dummy.closed = true; },
+      focus: function() {},
+      blur: function() {},
+      postMessage: function() {}
+    };
+    if (url && url !== 'about:blank') {
+      openExternal(url);
+    }
+    return dummy;
+  };
+  try {
+    if (!navigator.clipboard) {
+      navigator.clipboard = {};
+    }
+    var origWriteText = navigator.clipboard.writeText ? navigator.clipboard.writeText.bind(navigator.clipboard) : null;
+    navigator.clipboard.writeText = function(text) {
+      if (origWriteText) {
+        return origWriteText(text).catch(function() {
+          if (window.swaiBridge && typeof window.swaiBridge.copyToClipboard === 'function') {
+            window.swaiBridge.copyToClipboard(text);
+            return Promise.resolve();
+          }
+          return Promise.reject(new Error('copy failed'));
+        });
+      } else if (window.swaiBridge && typeof window.swaiBridge.copyToClipboard === 'function') {
+        window.swaiBridge.copyToClipboard(text);
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error('Clipboard not supported'));
+    };
+  } catch (clipErr) {
+    console.warn('[SwaiShim] clipboard hook error:', clipErr);
+  }
+  document.addEventListener('click', function(e) {
+    var target = e.target;
+    while (target && target.tagName !== 'A') {
+      target = target.parentElement;
+    }
+    if (target && target.tagName === 'A') {
+      var href = target.getAttribute('href');
+      var targetAttr = target.getAttribute('target');
+      if (href && (href.startsWith('http://') || href.startsWith('https://')) && (targetAttr === '_blank' || !href.includes(window.location.host))) {
+        e.preventDefault();
+        openExternal(href);
+      }
+    }
+  }, true);
+})();
+</script>`;
+          html = html.replace('<head>', '<head>\n    ' + shim);
+          const file = fs.openSync(indexHtmlPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+          fs.writeSync(file.fd, html);
+          fs.closeSync(file);
+          hilog.info(DOMAIN, TAG, 'Successfully injected swai-window-open-shim into %{public}s', indexHtmlPath);
+        }
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'Failed to patch index.html: %{public}s', JSON.stringify(e));
     }
   }
 

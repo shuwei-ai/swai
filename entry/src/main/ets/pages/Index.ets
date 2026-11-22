@@ -67,9 +67,43 @@ export interface ExtractedFileRef {
   previewUri?: string;
 }
 
+class SwaiWebBridge {
+  openUrl(url: string): void {
+    if (!url || url.length === 0 || url === 'about:blank') {
+      return;
+    }
+    hilog.info(0x3F00, 'Index', 'SwaiWebBridge openUrl: %{public}s', url);
+    BrowserPipState.getInstance().showExpanded();
+    BrowserManager.getInstance().ensureControllerAttached(3000).then(() => {
+      BrowserManager.getInstance().controller.loadUrl(url);
+    }).catch((err: Error) => {
+      hilog.warn(0x3F00, 'Index', 'SwaiWebBridge loadUrl error: %{public}s', JSON.stringify(err));
+    });
+  }
+
+  copyToClipboard(text: string): void {
+    if (!text || text.length === 0) {
+      return;
+    }
+    hilog.info(0x3F00, 'Index', 'SwaiWebBridge copyToClipboard: len=%{public}d', text.length);
+    try {
+      const pasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);
+      const systemPasteboard = pasteboard.getSystemPasteboard();
+      systemPasteboard.setData(pasteData).then(() => {
+        promptAction.showToast({ message: '已复制到剪贴板', duration: 1500 });
+      }).catch((_e: Error) => {
+        promptAction.showToast({ message: '复制失败', duration: 1500 });
+      });
+    } catch (err) {
+      promptAction.showToast({ message: '复制失败', duration: 1500 });
+    }
+  }
+}
+
 @Entry
 @Component
 struct Index {
+  private swaiWebBridge: SwaiWebBridge = new SwaiWebBridge();
   // Shell Console States
   @State private host: string = '127.0.0.1';
   @State private port: string = '45661';
@@ -3726,28 +3760,13 @@ struct Index {
             .javaScriptAccess(true)
             .onlineImageAccess(true)
             .databaseAccess(true)
+            .javaScriptProxy({
+              object: this.swaiWebBridge,
+              name: 'swaiBridge',
+              methodList: ['openUrl', 'copyToClipboard'],
+              controller: this.dshWebviewController
+            })
             .multiWindowAccess(false)
-            .onWindowNew((event) => {
-              hilog.info(0x3F00, 'Index', 'DSH onWindowNew intercepted: targetUrl=%{public}s', event ? event.targetUrl : '');
-              if (event && event.handler) {
-                if (event.targetUrl && event.targetUrl.trim().length > 0 && event.targetUrl !== 'about:blank') {
-                  BrowserPipState.getInstance().showExpanded();
-                  BrowserManager.getInstance().ensureControllerAttached(3000).then(() => {
-                    BrowserManager.getInstance().controller.loadUrl(event.targetUrl);
-                  }).catch((err: Error) => {
-                    hilog.warn(0x3F00, 'Index', 'loadUrl in browser error: %{public}s', JSON.stringify(err));
-                  });
-                }
-                try {
-                  event.handler.setWebController(null);
-                } catch (e) {
-                  // ignore
-                }
-              }
-            })
-            .onWindowExit(() => {
-              hilog.info(0x3F00, 'Index', 'DSH onWindowExit');
-            })
             .mixedMode(MixedMode.All)
             .zoomAccess(true)
             .overviewModeAccess(true)
@@ -3757,6 +3776,62 @@ struct Index {
             .overScrollMode(OverScrollMode.ALWAYS)
             .onPageBegin(() => {
               this.isDshLoading = true;
+              try {
+                this.dshWebviewController.runJavaScript(`
+                  (function() {
+                    if (window.__swaiShimInjected) return;
+                    window.__swaiShimInjected = true;
+                    function openExternal(url) {
+                      if (!url || url === 'about:blank') return;
+                      if (window.swaiBridge && typeof window.swaiBridge.openUrl === 'function') {
+                        window.swaiBridge.openUrl(url);
+                      } else {
+                        var retries = 0;
+                        var t = setInterval(function() {
+                          retries++;
+                          if (window.swaiBridge && typeof window.swaiBridge.openUrl === 'function') {
+                            clearInterval(t);
+                            window.swaiBridge.openUrl(url);
+                          } else if (retries > 30) {
+                            clearInterval(t);
+                          }
+                        }, 100);
+                      }
+                    }
+                    var origOpen = window.open;
+                    window.open = function(url, target, features) {
+                      console.log('[SwaiShim] window.open intercepted:', url, target);
+                      var dummy = {
+                        closed: false,
+                        opener: null,
+                        location: {
+                          _href: url || '',
+                          replace: function(newUrl) {
+                            console.log('[SwaiShim] dummy.location.replace:', newUrl);
+                            dummy.location._href = newUrl;
+                            openExternal(newUrl);
+                          },
+                          assign: function(newUrl) { dummy.location.replace(newUrl); },
+                          reload: function() {},
+                          get href() { return dummy.location._href; },
+                          set href(newUrl) { dummy.location.replace(newUrl); },
+                          toString: function() { return dummy.location._href; }
+                        },
+                        close: function() { dummy.closed = true; },
+                        focus: function() {},
+                        blur: function() {},
+                        postMessage: function() {}
+                      };
+                      if (url && url !== 'about:blank') {
+                        openExternal(url);
+                      }
+                      return dummy;
+                    };
+                  })();
+                `);
+              } catch (e) {
+                // ignore
+              }
             })
             .onPageEnd(() => {
               this.isDshLoading = false;
