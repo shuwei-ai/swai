@@ -29,6 +29,8 @@ export struct BrowserFloatingPip {
   @State private posY: number = 440;
   @State private isDragging: boolean = false;
   @State private attentionAlpha: number = 0.4;
+  private startPosX: number = 210;
+  private startPosY: number = 440;
 
   // Screen metrics
   private screenWidthVp: number = 380;
@@ -223,14 +225,30 @@ export struct BrowserFloatingPip {
           PanGesture({ fingers: 1, direction: PanDirection.All })
             .onActionStart(() => {
               this.isDragging = true;
+              this.startPosX = this.posX;
+              this.startPosY = this.posY;
             })
             .onActionUpdate((event?: GestureEvent) => {
               if (event) {
-                this.posX += event.offsetX;
-                this.posY += event.offsetY;
+                const width = this.getWindowWidth();
+                const height = this.getWindowHeight();
+                const minX = 0;
+                const maxX = Math.max(0, this.screenWidthVp - width);
+                const minY = 40;
+                const maxY = Math.max(minY, this.screenHeightVp - height - 40);
+
+                const nextX = this.startPosX + event.offsetX;
+                const nextY = this.startPosY + event.offsetY;
+
+                this.posX = Math.max(minX, Math.min(maxX, nextX));
+                this.posY = Math.max(minY, Math.min(maxY, nextY));
               }
             })
             .onActionEnd(() => {
+              this.isDragging = false;
+              this.snapToEdge(this.posX, this.posY);
+            })
+            .onActionCancel(() => {
               this.isDragging = false;
               this.snapToEdge(this.posX, this.posY);
             })
