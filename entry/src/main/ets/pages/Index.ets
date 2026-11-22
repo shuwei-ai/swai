@@ -359,8 +359,6 @@ struct Index {
     await MemoryStore.getInstance().init(this.context);
     this.memoryLessons = [...MemoryStore.getInstance().getLessons()];
 
-    AgentWorkspace.getInstance().init(this.context);
-
     await SkillManager.getInstance().init(this.context);
     this.skillsList = [...SkillManager.getInstance().getSkills()];
 
@@ -3728,7 +3726,28 @@ struct Index {
             .javaScriptAccess(true)
             .onlineImageAccess(true)
             .databaseAccess(true)
-            .multiWindowAccess(true)
+            .multiWindowAccess(false)
+            .onWindowNew((event) => {
+              hilog.info(0x3F00, 'Index', 'DSH onWindowNew intercepted: targetUrl=%{public}s', event ? event.targetUrl : '');
+              if (event && event.handler) {
+                if (event.targetUrl && event.targetUrl.trim().length > 0 && event.targetUrl !== 'about:blank') {
+                  BrowserPipState.getInstance().showExpanded();
+                  BrowserManager.getInstance().ensureControllerAttached(3000).then(() => {
+                    BrowserManager.getInstance().controller.loadUrl(event.targetUrl);
+                  }).catch((err: Error) => {
+                    hilog.warn(0x3F00, 'Index', 'loadUrl in browser error: %{public}s', JSON.stringify(err));
+                  });
+                }
+                try {
+                  event.handler.setWebController(null);
+                } catch (e) {
+                  // ignore
+                }
+              }
+            })
+            .onWindowExit(() => {
+              hilog.info(0x3F00, 'Index', 'DSH onWindowExit');
+            })
             .mixedMode(MixedMode.All)
             .zoomAccess(true)
             .overviewModeAccess(true)

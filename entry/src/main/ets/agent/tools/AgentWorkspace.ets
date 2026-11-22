@@ -54,14 +54,20 @@ export class AgentWorkspace {
       return;
     }
     try {
+      const libDir = `${this.context.filesDir}/lib/python3.13`;
+      // Fast-path: If python stdlib is already decompressed, skip all heavy synchronous I/O
+      try {
+        if (fs.accessSync(`${libDir}/encodings`)) {
+          return;
+        }
+      } catch (_e) {}
+
       const zipDest = `${this.context.filesDir}/python313.zip`;
-      const rawContent = this.context.resourceManager.getRawFileContentSync('python313.zip');
-      const rawSize = rawContent.byteLength;
       let needExtract = true;
       try {
         if (fs.accessSync(zipDest)) {
           const stat = fs.statSync(zipDest);
-          if (stat.size === rawSize) {
+          if (stat.size > 0) {
             needExtract = false;
           }
         }
@@ -70,6 +76,8 @@ export class AgentWorkspace {
       }
 
       if (needExtract) {
+        const rawContent = this.context.resourceManager.getRawFileContentSync('python313.zip');
+        const rawSize = rawContent.byteLength;
         hilog.info(DOMAIN, TAG, 'Extracting python313.zip from rawfile (size: %{public}d)...', rawSize);
         const opened = fs.openSync(zipDest, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
         fs.writeSync(opened.fd, rawContent.buffer);
@@ -77,7 +85,6 @@ export class AgentWorkspace {
         hilog.info(DOMAIN, TAG, 'python313.zip successfully deployed at %{public}s', zipDest);
       }
 
-      const libDir = `${this.context.filesDir}/lib/python3.13`;
       let needDecompress = needExtract;
       if (!needDecompress) {
         try {
@@ -127,6 +134,8 @@ export class AgentWorkspace {
     }
     const runtimeDir = `${this.context.filesDir}/dsh-runtime`;
     const binJs = `${runtimeDir}/node_modules/@deepseek-ai/dsh/lib/bin.js`;
+    // Ensure bridge directory exists before writing bridge scripts
+    this.ensureDir(`${runtimeDir}/bridge`);
     // Always keep bridge scripts in sync with latest rawfiles (with dual swai & piha support)
     const bridgeSyncList: [string, string][] = [
       ['dsh_bridge/bridge-client.mjs', `${runtimeDir}/bridge/bridge-client.mjs`],

@@ -15,16 +15,30 @@
 #include <poll.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#if __has_include(<hilog/log.h>)
 #include <hilog/log.h>
+#else
+#define OH_LOG_Print(type, level, domain, tag, fmt, ...) ((void)0)
+#define LOG_APP 0
+#define LOG_INFO 0
+#define LOG_WARN 0
+#define LOG_ERROR 0
+#define LOG_DEBUG 0
+#endif
 #include <signal.h>
 #include <cerrno>
+#if (defined(__linux__) || defined(__OHOS__)) && defined(__aarch64__)
 #include <ucontext.h>
+#endif
 #include <sys/stat.h>
 #include <sys/socket.h>
+#if __has_include(<sys/epoll.h>)
+#include <sys/epoll.h>
+#endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#if defined(__aarch64__)
+#if (defined(__linux__) || defined(__OHOS__)) && defined(__aarch64__)
 static struct sigaction g_prev_sigsys;
 static void HandleSigsys(int sig, siginfo_t* info, void* ucontext_raw) {
     if (sig == SIGSYS && ucontext_raw && info) {
@@ -49,6 +63,14 @@ static void HandleSigsys(int sig, siginfo_t* info, void* ucontext_raw) {
 }
 #endif
 
+#if !defined(__OHOS__) && !defined(__ANDROID__)
+enum fdsan_error_level {
+    FDSAN_ERROR_LEVEL_DISABLED = 0,
+    FDSAN_ERROR_LEVEL_WARN_ONCE,
+    FDSAN_ERROR_LEVEL_WARN_ALWAYS,
+    FDSAN_ERROR_LEVEL_FATAL,
+};
+#endif
 typedef enum fdsan_error_level (*FdsanSetErrorLevelFunc)(enum fdsan_error_level);
 typedef uint64_t (*FdsanGetOwnerTagFunc)(int);
 typedef void (*FdsanExchangeOwnerTagFunc)(int, uint64_t, uint64_t);
@@ -64,6 +86,7 @@ static void DisableFdsan() {
         auto get_tag = (FdsanGetOwnerTagFunc)dlsym(libc, "fdsan_get_owner_tag");
         auto exchange_tag = (FdsanExchangeOwnerTagFunc)dlsym(libc, "fdsan_exchange_owner_tag");
         if (get_tag && exchange_tag) {
+            exchange_tag(STDIN_FILENO, get_tag(STDIN_FILENO), 0);
             exchange_tag(STDOUT_FILENO, get_tag(STDOUT_FILENO), 0);
             exchange_tag(STDERR_FILENO, get_tag(STDERR_FILENO), 0);
         }
@@ -226,7 +249,7 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
         }
 
         // 2. Prepare workspace directory & environment variables
-#if defined(__aarch64__)
+#if (defined(__linux__) || defined(__OHOS__)) && defined(__aarch64__)
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_sigaction = HandleSigsys;
@@ -298,7 +321,6 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "writeLog('PRELOAD', 'Node preload script executing...');\n"
                 "try {\n"
                 "  const dummyStdin = new Readable({ read() {} });\n"
-                "  dummyStdin.fd = 0;\n"
                 "  dummyStdin.isTTY = false;\n"
                 "  dummyStdin.setRawMode = () => dummyStdin;\n"
                 "  dummyStdin.pause = () => dummyStdin;\n"
@@ -678,6 +700,8 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
         std::string patch_json = options.runtime_root + "/bridge/swai-host.patch.json";
         std::vector<std::string> args = {
             "node",
+            "--jitless",
+            "--no-opt",
             "--expose-internals",
             "-r",
             preload_js,
@@ -701,7 +725,33 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
         }
         argv_ptrs.push_back(nullptr);
 
-        // 5. Run node without stdio hijacking to prevent ArkWeb log thrashing
+        // 5. Ensure STDIN_FILENO is a valid, pollable descriptor to prevent libuv epoll_ctl abort
+#if defined(__linux__) || defined(__OHOS__) || defined(__aarch64__)
+#if __has_include(<sys/epoll.h>)
+        int test_epfd = epoll_create1(0);
+        bool stdin_pollable = false;
+        if (test_epfd >= 0) {
+            struct epoll_event ev{};
+            ev.events = EPOLLIN;
+            if (epoll_ctl(test_epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev) == 0) {
+                stdin_pollable = true;
+                epoll_ctl(test_epfd, EPOLL_CTL_DEL, STDIN_FILENO, nullptr);
+            }
+            close(test_epfd);
+        }
+        if (!stdin_pollable) {
+            int pfd[2];
+            if (pipe(pfd) == 0) {
+                dup2(pfd[0], STDIN_FILENO);
+                close(pfd[0]);
+                close(pfd[1]); // Write end closed: immediate EOF on read, but fd 0 is guaranteed pollable by epoll
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0x3201, "DSHHost", "Emulated pollable STDIN pipe for libuv.");
+            }
+        }
+#endif
+#endif
+
+        // Run node without stdio hijacking to prevent ArkWeb log thrashing
         DisableFdsan();
 
         OH_LOG_Print(LOG_APP, LOG_INFO, 0x3201, "DSHHost", "Invoking node::Start with bin=%{public}s", bin_path.c_str());

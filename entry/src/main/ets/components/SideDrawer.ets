@@ -10,17 +10,72 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import hilog from '@ohos.hilog';
+
+@Component
+struct SideDrawerNavRow {
+  @Prop icon: string = '';
+  @Prop label: string = '';
+  @Prop isSelected: boolean = false;
+  onClickItem?: () => void = undefined;
+
+  build() {
+    Row({ space: 12 }) {
+      Text(this.icon)
+        .fontSize(16)
+
+      Text(this.label)
+        .fontSize(15)
+        .fontWeight(this.isSelected ? FontWeight.Bold : FontWeight.Normal)
+        .fontColor(this.isSelected ? '#0284c7' : '#1e293b')
+        .layoutWeight(1)
+
+      if (this.isSelected) {
+        Circle({ width: 6, height: 6 })
+          .fill('#0284c7')
+      }
+    }
+    .width('100%')
+    .height(48)
+    .padding({ left: 14, right: 14 })
+    .borderRadius(12)
+    .backgroundColor(this.isSelected ? '#f0f9ff' : 'transparent')
+    .onClick(() => {
+      if (this.onClickItem) {
+        this.onClickItem();
+      }
+    })
+  }
+}
+
 @Component
 export struct SideDrawer {
-  @Prop isOpen: boolean = false;
+  @Prop @Watch('onDrawerOpenChange') isOpen: boolean = false;
   @Prop shellConnected: boolean = false;
   @Prop dshReady: boolean = false;
-  @Prop currentActivePage: string = 'dsh'; // 'console' | 'dsh' | 'browser'
+  @Prop @Watch('onCurrentActivePageChange') currentActivePage: string = 'dsh'; // 'console' | 'dsh' | 'browser'
+  @State private activePage: string = 'dsh';
   @State private isAboutOpen: boolean = false;
 
   onClose?: () => void = undefined;
   onSelectPage?: (page: 'console' | 'dsh' | 'browser') => void = undefined;
   onOpenUrl?: (url: string) => void = undefined;
+
+  aboutToAppear() {
+    this.activePage = this.currentActivePage;
+  }
+
+  onCurrentActivePageChange() {
+    hilog.info(0x3F00, 'SideDrawer', 'currentActivePage changed to: %{public}s', this.currentActivePage);
+    this.activePage = this.currentActivePage;
+  }
+
+  onDrawerOpenChange() {
+    if (this.isOpen) {
+      hilog.info(0x3F00, 'SideDrawer', 'drawer opened, syncing activePage=%{public}s from currentActivePage=%{public}s', this.activePage, this.currentActivePage);
+      this.activePage = this.currentActivePage;
+    }
+  }
 
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
@@ -81,20 +136,44 @@ export struct SideDrawer {
 
         // Core Real Navigation Items
         Column({ space: 8 }) {
-          // Swai Agent (Primary active item)
-          this.buildNavRow('🤖', 'Swai 智能体', () => {
-            if (this.onSelectPage) this.onSelectPage('dsh');
-          }, this.currentActivePage === 'dsh')
+          // Swai Agent
+          SideDrawerNavRow({
+            icon: '🤖',
+            label: 'Swai 智能体',
+            isSelected: this.activePage === 'dsh',
+            onClickItem: () => {
+              this.activePage = 'dsh';
+              if (this.onSelectPage) {
+                this.onSelectPage('dsh');
+              }
+            }
+          })
 
           // Shell Terminal
-          this.buildNavRow('💻', 'Shell 终端', () => {
-            if (this.onSelectPage) this.onSelectPage('console');
-          }, this.currentActivePage === 'console')
+          SideDrawerNavRow({
+            icon: '💻',
+            label: 'Shell 终端',
+            isSelected: this.activePage === 'console',
+            onClickItem: () => {
+              this.activePage = 'console';
+              if (this.onSelectPage) {
+                this.onSelectPage('console');
+              }
+            }
+          })
 
           // Browser
-          this.buildNavRow('🌐', '浏览器', () => {
-            if (this.onSelectPage) this.onSelectPage('browser');
-          }, this.currentActivePage === 'browser')
+          SideDrawerNavRow({
+            icon: '🌐',
+            label: '浏览器',
+            isSelected: this.activePage === 'browser',
+            onClickItem: () => {
+              this.activePage = 'browser';
+              if (this.onSelectPage) {
+                this.onSelectPage('browser');
+              }
+            }
+          })
         }
         .width('100%')
         .padding({ left: 12, right: 12 })
@@ -141,6 +220,7 @@ export struct SideDrawer {
           .backgroundColor('#f0f9ff')
           .border({ width: 1, color: '#e0f2fe' })
           .onClick(() => {
+            this.activePage = 'browser';
             if (this.onOpenUrl) {
               this.onOpenUrl('https://github.com/shuwei-ai/swai');
             }
@@ -226,6 +306,7 @@ export struct SideDrawer {
               .padding({ top: 4 })
               .onClick(() => {
                 this.isAboutOpen = false;
+                this.activePage = 'browser';
                 if (this.onOpenUrl) {
                   this.onOpenUrl('https://github.com/shuwei-ai/swai');
                 }
@@ -252,6 +333,7 @@ export struct SideDrawer {
                 .border({ width: 1, color: '#bae6fd' })
                 .onClick(() => {
                   this.isAboutOpen = false;
+                  this.activePage = 'browser';
                   if (this.onOpenUrl) {
                     this.onOpenUrl('https://github.com/shuwei-ai/swai');
                   }
@@ -298,32 +380,5 @@ export struct SideDrawer {
     }
     .width('100%')
     .alignItems(VerticalAlign.Center)
-  }
-
-  @Builder
-  buildNavRow(icon: string, label: string, onClick: () => void, isSelected: boolean) {
-    Row({ space: 12 }) {
-      Text(icon)
-        .fontSize(16)
-
-      Text(label)
-        .fontSize(15)
-        .fontWeight(isSelected ? FontWeight.Bold : FontWeight.Normal)
-        .fontColor(isSelected ? '#0284c7' : '#1e293b')
-        .layoutWeight(1)
-
-      if (isSelected) {
-        Circle({ width: 6, height: 6 })
-          .fill('#0284c7')
-      }
-    }
-    .width('100%')
-    .height(48)
-    .padding({ left: 14, right: 14 })
-    .borderRadius(12)
-    .backgroundColor(isSelected ? '#f0f9ff' : 'transparent')
-    .onClick(() => {
-      onClick();
-    })
   }
 }
