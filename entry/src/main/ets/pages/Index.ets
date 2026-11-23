@@ -22,6 +22,8 @@ import { TerminalController } from '../terminal/TerminalController';
 import {
   AgentConfigStore,
   AgentModelConfig,
+  FreeModelPreset,
+  FREE_MODEL_PRESETS,
   AgentSession,
   ImageAttachment,
   ImageEncoder,
@@ -976,6 +978,10 @@ struct Index {
       autoRunTools: this.agentAutoRunTools,
       enableThinking: this.agentEnableThinking
     };
+    const isKeyless = newConfig.baseUrl.includes('opencode.ai')
+      || newConfig.baseUrl.includes('kilo-ai.com')
+      || newConfig.baseUrl.includes('127.0.0.1')
+      || newConfig.baseUrl.includes('localhost');
     await AgentConfigStore.getInstance().save(this.context, newConfig);
     const remoteCfg = this.buildCurrentRemoteConfig();
     await AgentConfigStore.getInstance().saveRemoteConfig(this.context, remoteCfg);
@@ -983,7 +989,10 @@ struct Index {
       this.agentSession.updateConfig(newConfig);
     }
     this.showSettings = false;
-    promptAction.showToast({ message: '模型与远程 SSH 配置已保存', duration: 2000 });
+    const toastMsg = isKeyless
+      ? `免费模型已配置: ${newConfig.modelName} ✅`
+      : '模型与远程 SSH 配置已保存';
+    promptAction.showToast({ message: toastMsg, duration: 2000 });
   }
 
   private async pickAgentImages(): Promise<void> {
@@ -2409,6 +2418,51 @@ struct Index {
             .fontWeight(FontWeight.Medium)
             .fontColor('#475569')
             .width('100%')
+
+            // ─── Free Model Presets (dsh-our-free-model) ───
+            Column({ space: 6 }) {
+              Row({ space: 6 }) {
+                Text('🆓')
+                  .fontSize(14)
+                Text('免费模型 (无需 API Key)')
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor('#059669')
+              }
+              .width('100%')
+
+              Text('基于 dsh-our-free-model 插件 — 点击即可一键切换到免费前沿模型')
+                .fontSize(10)
+                .fontColor('#6b7280')
+                .width('100%')
+
+              Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
+                ForEach(FREE_MODEL_PRESETS, (preset: FreeModelPreset) => {
+                  Button(preset.label)
+                    .fontSize(10)
+                    .height(26)
+                    .padding({ left: 8, right: 8 })
+                    .margin({ right: 6, bottom: 6 })
+                    .backgroundColor(this.agentBaseUrl === preset.baseUrl && this.agentModelName === preset.modelName ? '#059669' : '#ecfdf5')
+                    .fontColor(this.agentBaseUrl === preset.baseUrl && this.agentModelName === preset.modelName ? '#ffffff' : '#059669')
+                    .border({ width: 1, color: '#a7f3d0' })
+                    .borderRadius(14)
+                    .onClick(() => {
+                      this.agentBaseUrl = preset.baseUrl;
+                      this.agentApiKey = '';
+                      this.agentModelName = preset.modelName;
+                    })
+                })
+              }
+              .width('100%')
+            }
+            .width('100%')
+            .padding(10)
+            .backgroundColor('#f0fdf4')
+            .borderRadius(8)
+            .border({ width: 1, color: '#bbf7d0' })
+
+            Divider().color('#e2e8f0').margin({ top: 2, bottom: 2 })
 
           Row({ space: 8 }) {
             Text('Base URL:')

@@ -212,6 +212,9 @@ export class AgentWorkspace {
     // Always enforce window.open shim in dsh-web-frontend/dist/index.html to prevent white screen on login
     this.patchDshIndexHtml(runtimeDir);
 
+    // Always enforce resilience in dsh-working-directory to prevent session crash on missing directory
+    this.patchDshWorkingDirectory(runtimeDir);
+
     try {
       if (fs.accessSync(binJs)) {
         return runtimeDir;
@@ -245,6 +248,7 @@ export class AgentWorkspace {
       await zlib.decompressFile(zipDest, runtimeDir);
       hilog.info(DOMAIN, TAG, 'dsh-runtime decompressed successfully to %{public}s', runtimeDir);
       this.patchDshIndexHtml(runtimeDir);
+      this.patchDshWorkingDirectory(runtimeDir);
       try {
         fs.unlinkSync(zipDest);
       } catch (_u) {}
@@ -362,6 +366,31 @@ export class AgentWorkspace {
       }
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'Failed to patch index.html: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  /**
+   * Patches @deepseek-ai/dsh-working-directory/lib/index.js to prevent turn failures
+   * when historical sessions reference a directory that has been deleted or moved.
+   */
+  private patchDshWorkingDirectory(runtimeDir: string): void {
+    try {
+      const workingDirJsPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-working-directory/lib/index.js`;
+      if (fs.accessSync(workingDirJsPath)) {
+        let curContent = fs.readTextSync(workingDirJsPath);
+        if (!curContent.includes('SWAI_DIR_FALLBACK')) {
+          curContent = curContent.replace(
+            'if (info?.type !== "directory") throw new Error(`working-directory: directory does not exist: ${JSON.stringify(path)}`);',
+            '/* SWAI_DIR_FALLBACK */ if (info?.type !== "directory") { try { const _fs = require("node:fs"); const _p = this.ctx.fs.processPath(target); _fs.mkdirSync(_p, { recursive: true }); return _p; } catch(_e){} return this.defaultDirectory; }'
+          );
+          const file = fs.openSync(workingDirJsPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+          fs.writeSync(file.fd, curContent);
+          fs.closeSync(file);
+          hilog.info(DOMAIN, TAG, 'Enforced SWAI_DIR_FALLBACK at %{public}s', workingDirJsPath);
+        }
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'Failed to patch dsh-working-directory: %{public}s', `${e}`);
     }
   }
 
@@ -644,6 +673,13 @@ export class AgentWorkspace {
       return this.resolvePublicPath(trimmed);
     }
     if (trimmed.startsWith('/')) {
+      const doubleNestedPrefix = `${this.workspaceRoot}/workspace/`;
+      if (trimmed.startsWith(doubleNestedPrefix)) {
+        trimmed = trimmed.substring(doubleNestedPrefix.length);
+        return this.normalizePath(`${this.workspaceRoot}/${trimmed}`);
+      } else if (trimmed === `${this.workspaceRoot}/workspace` || trimmed === `${this.workspaceRoot}/workspace `) {
+        return this.workspaceRoot;
+      }
       if (trimmed.startsWith('/workspace/')) {
         trimmed = trimmed.substring('/workspace/'.length);
         return this.normalizePath(`${this.workspaceRoot}/${trimmed}`);
@@ -664,7 +700,7 @@ export class AgentWorkspace {
 
   /**
    * Rescues any files trapped in duplicate nested workspace directories (e.g. 'workspace/workspace' or 'workspace/workspace ')
-   * by moving them up to this.workspaceRoot, and removes the stray directories.
+   * by moving them up to this.workspaceRoot, and links/ensures the candidate directories so legacy DSH sessions never fail.
    */
   cleanupDuplicateWorkspaceDirs(): void {
     try {
@@ -710,6 +746,27 @@ export class AgentWorkspace {
             }
           }
         } catch (_accErr) {}
+
+        // Ensure candidate directory is linked or recreated as a directory
+        // so historical DSH sessions pointing to badDir never fail with 'directory does not exist'
+        try {
+          if (!fs.accessSync(badDir)) {
+            let symlinkCreated = false;
+            try {
+              fs.symlinkSync(this.workspaceRoot, badDir);
+              symlinkCreated = true;
+              hilog.info(DOMAIN, TAG, 'Created symlink %{public}s -> %{public}s', badDir, this.workspaceRoot);
+            } catch (_symErr) {
+              symlinkCreated = false;
+            }
+            if (!symlinkCreated && !fs.accessSync(badDir)) {
+              fs.mkdirSync(badDir);
+              hilog.info(DOMAIN, TAG, 'Ensured fallback directory %{public}s', badDir);
+            }
+          }
+        } catch (_ensErr) {
+          hilog.warn(DOMAIN, TAG, 'Failed to ensure candidate %{public}s: %{public}s', badDir, `${_ensErr}`);
+        }
       }
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'cleanupDuplicateWorkspaceDirs failed: %{public}s', `${err}`);

@@ -335,10 +335,23 @@ export class DshAgentManager {
     });
   }
 
+  /**
+   * Check if the given baseUrl points to a local relay or a known free model gateway
+   * that does not require an API key (dsh-our-free-model compatible endpoints).
+   */
+  private static isKeylessEndpoint(baseUrl: string): boolean {
+    const lower = (baseUrl || '').toLowerCase();
+    return lower.includes('127.0.0.1')
+      || lower.includes('localhost')
+      || lower.includes('opencode.ai')
+      || lower.includes('kilo-ai.com');
+  }
+
   async sendPrompt(prompt: string, images?: ImageAttachment[]): Promise<boolean> {
     const config = AgentConfigStore.getInstance().getConfig();
-    if (!config.apiKey || config.apiKey.trim().length === 0) {
-      const err = '请先点击右上角「模型设置」配置 API Key (如 MiniMax / DeepSeek)';
+    if (!DshAgentManager.isKeylessEndpoint(config.baseUrl)
+      && (!config.apiKey || config.apiKey.trim().length === 0)) {
+      const err = '请先点击右上角「模型设置」配置 API Key，或选择「🆓 免费模型」预设';
       DshClient.getInstance().emit({ kind: 'error', error: err });
       return false;
     }

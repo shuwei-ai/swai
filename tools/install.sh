@@ -15,7 +15,11 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
 DEVECO=/Applications/DevEco-Studio.app/Contents
-export DEVECO_SDK_HOME="$DEVECO/sdk"
+if [ -d "$DEVECO/sdk" ]; then
+    export DEVECO_SDK_HOME="$DEVECO/sdk"
+elif [ -d "$DEVECO/sdk/default" ]; then
+    export DEVECO_SDK_HOME="$DEVECO/sdk/default"
+fi
 
 SIGN_PATCHED=0
 cleanup() {

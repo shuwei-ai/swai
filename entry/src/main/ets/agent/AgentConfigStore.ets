@@ -30,6 +30,51 @@ const DEFAULT_CONFIG: AgentModelConfig = {
   enableThinking: true
 };
 
+/**
+ * Free model presets powered by dsh-our-free-model upstream gateways.
+ * Zero API key required — connects directly to public model gateways.
+ * See: https://github.com/Ebony-Vinyl/dsh-our-free-model
+ */
+export interface FreeModelPreset {
+  label: string;
+  baseUrl: string;
+  modelName: string;
+  description: string;
+}
+
+export const FREE_MODEL_PRESETS: FreeModelPreset[] = [
+  {
+    label: 'DeepSeek V3 (Free)',
+    baseUrl: 'https://api.opencode.ai/v1',
+    modelName: 'deepseek-chat',
+    description: '免费 DeepSeek V3 — 高能力通用对话 + 工具调用'
+  },
+  {
+    label: 'DeepSeek R1 (Free)',
+    baseUrl: 'https://api.opencode.ai/v1',
+    modelName: 'deepseek-reasoner',
+    description: '免费 DeepSeek R1 — 深度推理链思考'
+  },
+  {
+    label: 'Kimi (Free)',
+    baseUrl: 'https://api.kilo-ai.com/v1',
+    modelName: 'kimi',
+    description: '免费 Moonshot Kimi — 超长上下文'
+  },
+  {
+    label: 'Claude 3.5 Sonnet (Free)',
+    baseUrl: 'https://api.kilo-ai.com/v1',
+    modelName: 'claude-3-5-sonnet-20241022',
+    description: '免费 Claude 3.5 Sonnet — 高级编码与分析'
+  },
+  {
+    label: 'GPT-4o (Free)',
+    baseUrl: 'https://api.kilo-ai.com/v1',
+    modelName: 'gpt-4o',
+    description: '免费 GPT-4o — OpenAI 多模态旗舰'
+  }
+];
+
 const DEFAULT_REMOTE_CONFIG: RemoteServerConfig = {
   enabled: false,
   host: '',
@@ -87,10 +132,10 @@ export class AgentConfigStore {
       if (!apiKey || apiKey.trim().length === 0) {
         apiKey = DEFAULT_CONFIG.apiKey;
       }
-      if (!baseUrl || baseUrl.trim().length === 0 || baseUrl.includes('deepseek')) {
+      if (!baseUrl || baseUrl.trim().length === 0) {
         baseUrl = DEFAULT_CONFIG.baseUrl;
       }
-      if (!modelName || modelName.trim().length === 0 || modelName.includes('deepseek') || modelName.includes('查询')) {
+      if (!modelName || modelName.trim().length === 0 || modelName.includes('查询')) {
         modelName = DEFAULT_CONFIG.modelName;
       }
 
