@@ -4,6 +4,7 @@
  * 2. AI Agent: Native HarmonyOS Pi Coding & System Agent with bash, read, write, and edit tools.
  */
 import common from '@ohos.app.ability.common';
+import type Want from '@ohos.app.ability.Want';
 import hilog from '@ohos.hilog';
 import promptAction from '@ohos.promptAction';
 import pasteboard from '@ohos.pasteboard';
@@ -15,6 +16,12 @@ import webview from '@ohos.web.webview';
 import http from '@ohos.net.http';
 
 import { BridgeController } from '../common/BridgeController';
+import {
+  HdcDebugPhase,
+  HdcDebugSnapshot,
+  isValidPortInput,
+  parsePortInput
+} from '../common/HdcDebugState';
 import { GrantEntry, GrantStore } from '../service/GrantStore';
 import { Shizuku } from '../client/Shizuku';
 import { WebTerminalView } from '../terminal/WebTerminalView';
@@ -58,6 +65,7 @@ import { BrowserPipState, PipMode, PipGlowStatus } from '../browser/BrowserPipSt
 import { BrowserHomeView } from '../browser/BrowserHomeView';
 import { BrowserFloatingPip } from '../browser/BrowserFloatingPip';
 import { SideDrawer } from '../components/SideDrawer';
+import { DeveloperDebugGuide } from '../components/DeveloperDebugGuide';
 
 export interface ExtractedFileRef {
   path: string;
@@ -108,8 +116,20 @@ struct Index {
   private swaiWebBridge: SwaiWebBridge = new SwaiWebBridge();
   // Shell Console States
   @State private host: string = '127.0.0.1';
-  @State private port: string = '45661';
+  @State private port: string = '';
   @State private connected: boolean = false;
+  @State private debugPhase: HdcDebugPhase = 'checking';
+  @State private debugPort: number = 0;
+  @State private debugLastPort: number = 0;
+  @State private debugLastError: string = '';
+  @State private uidVerified: boolean = false;
+  @State private uidInfo: string = '';
+  @State private isDebugGuideOpen: boolean = false;
+  @StorageProp('appForegroundTick') @Watch('onAppForegroundTick') appForegroundTick: number = 0;
+  private waitingForSettingsReturn: boolean = false;
+  private lastAutoRecheckMs: number = 0;
+  private removeDebugStateListener?: () => void = undefined;
+  private lastConnectedNotified: boolean = false;
   @State private busy: boolean = false;
   @State private message: string = '';
   @State private command: string = 'id';
@@ -227,6 +247,14 @@ struct Index {
       BrowserPipState.getInstance().showMini();
       BrowserPipState.getInstance().setGlow(PipGlowStatus.RUNNING);
     });
+    const onBridgeSnapshot = (snap: HdcDebugSnapshot): void => {
+      this.applyDebugSnapshot(snap);
+    };
+    BridgeController.getInstance().addStateListener(onBridgeSnapshot);
+    this.removeDebugStateListener = () => {
+      BridgeController.getInstance().removeStateListener(onBridgeSnapshot);
+    };
+    this.applyDebugSnapshot(BridgeController.getInstance().getDebugSnapshot());
     this.refresh();
     this.tryAutoConnect();
     this.initAgent();
@@ -240,7 +268,19 @@ struct Index {
     });
   }
 
+  onPageShow(): void {
+    this.triggerForegroundRecheckIfNeeded();
+  }
+
+  onAppForegroundTick(): void {
+    this.triggerForegroundRecheckIfNeeded();
+  }
+
   aboutToDisappear(): void {
+    if (this.removeDebugStateListener) {
+      this.removeDebugStateListener();
+      this.removeDebugStateListener = undefined;
+    }
     if (this.removeOverlayListener) {
       this.removeOverlayListener();
     }
@@ -1617,33 +1657,123 @@ struct Index {
     }
   }
 
+  private applyDebugSnapshot(snap: HdcDebugSnapshot): void {
+    this.debugPhase = snap.phase;
+    this.connected = snap.connected;
+    this.debugPort = snap.port;
+    this.debugLastPort = snap.lastPort;
+    this.debugLastError = snap.lastError;
+    this.uidVerified = snap.uidVerified;
+    this.uidInfo = snap.uidInfo;
+    if (snap.publicKey.length > 0) {
+      this.publicKey = snap.publicKey;
+    }
+    if (snap.port > 0) {
+      this.port = String(snap.port);
+    } else if (this.port.trim().length === 0 && snap.lastPort > 0) {
+      this.port = String(snap.lastPort);
+    }
+
+    if (snap.connected) {
+      this.message = snap.uidInfo.length > 0
+        ? `已连接 (${snap.uidInfo})`
+        : '已连接，命令以 uid 2000 (shell) 运行。';
+      if (!this.lastConnectedNotified) {
+        this.lastConnectedNotified = true;
+        this.onShellConnectedSideEffects();
+      }
+    } else {
+      this.lastConnectedNotified = false;
+      if (snap.phase === 'checking') {
+        this.message = '正在自动检测本机无线调试服务...';
+      } else if (snap.phase === 'awaiting_auth') {
+        this.message = '请在系统弹出的「允许无线调试」提示框中选择「始终允许」。';
+      } else if (snap.phase === 'auth_rejected') {
+        this.message = '调试授权被拒绝或超时，请重试并选择「始终允许」。';
+      } else if (snap.phase === 'need_port') {
+        this.message = '未自动识别端口，请在「开发者选项 → 无线调试」查看端口并手动填写。';
+      } else if (snap.lastError.length > 0) {
+        this.message = `${snap.lastError} 请在「开发者选项 → 无线调试」中开启后重试。`;
+      } else {
+        this.message = '请在「设置 → 系统 → 开发者选项」中开启「无线调试」。';
+      }
+    }
+  }
+
+  private async onShellConnectedSideEffects(): Promise<void> {
+    if (this.context === undefined) {
+      return;
+    }
+    try {
+      AgentWorkspace.getInstance().ensurePermissionsSilently();
+      await SkillManager.getInstance().init(this.context as common.Context);
+      this.skillsList = [...SkillManager.getInstance().getSkills()];
+      if (this.agentSession) {
+        this.agentSession.refreshSystemPrompt();
+      }
+    } catch (_e) {
+      // ignore
+    }
+    this.loadGrants();
+  }
+
+  private triggerForegroundRecheckIfNeeded(): void {
+    if (this.context === undefined || this.connected || this.busy) {
+      this.waitingForSettingsReturn = false;
+      return;
+    }
+    const now = Date.now();
+    const fromSettings = this.waitingForSettingsReturn;
+    if (!fromSettings && (now - this.lastAutoRecheckMs) < 3000) {
+      return;
+    }
+    this.waitingForSettingsReturn = false;
+    this.lastAutoRecheckMs = now;
+    this.runForegroundAutoRecheck(fromSettings);
+  }
+
+  private async runForegroundAutoRecheck(fromSettings: boolean): Promise<void> {
+    await this.tryAutoConnect();
+    if (this.connected && fromSettings) {
+      promptAction.showToast({ message: '已自动检测到无线调试并完成连接', duration: 2000 });
+    }
+  }
+
+  private openSystemSettings(): void {
+    if (this.context === undefined) {
+      return;
+    }
+    this.waitingForSettingsReturn = true;
+    const want: Want = {
+      bundleName: 'com.huawei.hmos.settings',
+      abilityName: 'com.huawei.hmos.settings.MainAbility'
+    };
+    this.context.startAbility(want).then(() => {
+      promptAction.showToast({
+        message: '请在设置中进入「系统 → 开发者选项 → 无线调试」并开启，切回 Swai 将自动连接',
+        duration: 3500
+      });
+    }).catch((err: Error) => {
+      this.waitingForSettingsReturn = false;
+      hilog.warn(0x3F00, 'Index', 'Failed to open system settings: %{public}s', JSON.stringify(err));
+      promptAction.showToast({
+        message: '未能自动跳转，请手动打开「设置 → 系统 → 开发者选项 → 无线调试」',
+        duration: 3500
+      });
+    });
+  }
+
   /**
-   * On startup, try to find the device's hdc daemon on its own.
+   * On startup or foreground recheck, automatically find and connect to hdcd.
    */
   private async tryAutoConnect(): Promise<void> {
     if (this.context === undefined || this.connected) {
       return;
     }
+    this.lastAutoRecheckMs = Date.now();
     this.busy = true;
     try {
-      const port = Number.parseInt(this.port, 10);
-      const result = await BridgeController.getInstance().connect(this.context as common.Context, this.host, port);
-      if (result.ok) {
-        this.connected = true;
-        this.message = '已连接，命令以 uid 2000 (shell) 运行。';
-        try {
-          AgentWorkspace.getInstance().ensurePermissionsSilently();
-          await SkillManager.getInstance().init(this.context as common.Context);
-          this.skillsList = [...SkillManager.getInstance().getSkills()];
-          if (this.agentSession) {
-            this.agentSession.refreshSystemPrompt();
-          }
-        } catch (e) {
-          // ignore
-        }
-      } else {
-        this.message = `${result.error} 请在「开发者选项 → 无线调试」中开启后重试。`;
-      }
+      await BridgeController.getInstance().autoConnect(this.context as common.Context);
     } catch (error) {
       this.message = `连接失败：${error}`;
     } finally {
@@ -1653,12 +1783,7 @@ struct Index {
   }
 
   private refresh(): void {
-    const status = BridgeController.getInstance().status();
-    this.connected = status.connected;
-    this.publicKey = status.publicKey;
-    if (status.lastError.length > 0) {
-      this.message = status.lastError;
-    }
+    this.applyDebugSnapshot(BridgeController.getInstance().getDebugSnapshot());
     this.loadGrants();
     if (this.connected && this.skillsList.length === 0) {
       this.refreshSkills();
@@ -1673,31 +1798,16 @@ struct Index {
     this.grants = GrantStore.getInstance().list();
   }
 
-  private async connect(): Promise<void> {
+  private async connectWithTarget(targetHost: string, targetPort: number): Promise<void> {
     if (this.context === undefined) {
       return;
     }
     this.busy = true;
     this.message = '正在连接设备… 设备会弹出授权对话框，请选择「始终允许」。';
     try {
-      const port = Number.parseInt(this.port, 10);
-      const result = await BridgeController.getInstance().connect(this.context, this.host, port);
+      const result = await BridgeController.getInstance().connect(this.context, targetHost, targetPort);
       if (result.ok) {
-        this.connected = true;
-        this.message = '已连接，命令以 uid 2000 (shell) 运行。';
-        try {
-          AgentWorkspace.getInstance().ensurePermissionsSilently();
-          await SkillManager.getInstance().init(this.context as common.Context);
-          this.skillsList = [...SkillManager.getInstance().getSkills()];
-          if (this.agentSession) {
-            this.agentSession.refreshSystemPrompt();
-          }
-        } catch (e) {
-          // ignore
-        }
-      } else {
-        this.connected = false;
-        this.message = `连接失败：${result.error}`;
+        promptAction.showToast({ message: `已连接 ${targetHost}:${result.port > 0 ? result.port : targetPort}`, duration: 1800 });
       }
     } catch (error) {
       this.connected = false;
@@ -1708,20 +1818,50 @@ struct Index {
     }
   }
 
+  private async connect(): Promise<void> {
+    if (this.context === undefined) {
+      return;
+    }
+    const trimmedPort = this.port.trim();
+    if (trimmedPort.length === 0) {
+      await this.tryAutoConnect();
+      return;
+    }
+    if (!isValidPortInput(trimmedPort)) {
+      this.message = '请输入 1 - 65535 之间的有效端口号。';
+      promptAction.showToast({ message: '请输入 1 - 65535 之间的有效端口号', duration: 2000 });
+      return;
+    }
+    const parsedPort = parsePortInput(trimmedPort);
+    const targetHost = this.host.trim().length > 0 ? this.host.trim() : '127.0.0.1';
+    await this.connectWithTarget(targetHost, parsedPort);
+  }
+
   private async discover(): Promise<void> {
+    if (this.context === undefined) {
+      return;
+    }
+    await this.tryAutoConnect();
+  }
+
+  private disconnectBridge(): void {
+    BridgeController.getInstance().disconnect();
+    this.refresh();
+    promptAction.showToast({ message: '已断开开发者调试连接', duration: 1500 });
+  }
+
+  private async verifyBridgeUid(): Promise<void> {
+    if (this.busy) {
+      return;
+    }
     this.busy = true;
-    this.message = '正在查找设备上的调试服务…';
     try {
-      const ports = BridgeController.getInstance().listPorts();
-      const result = await BridgeController.getInstance().connect(this.context as common.Context, '127.0.0.1', 0);
-      if (result.ok) {
-        this.connected = true;
-        this.message = `已连接（设备监听端口：${ports.join(', ')}）。`;
+      const info = await BridgeController.getInstance().verifyUid();
+      if (info.length > 0) {
+        promptAction.showToast({ message: `校验成功：${info}`, duration: 2000 });
       } else {
-        this.message = `自动发现失败：${result.error} 请手动填写端口。`;
+        promptAction.showToast({ message: '校验失败，请确认调试服务仍在运行', duration: 2000 });
       }
-    } catch (error) {
-      this.message = `自动发现失败：${error} 请手动填写端口。`;
     } finally {
       this.busy = false;
       this.refresh();
@@ -1881,13 +2021,40 @@ struct Index {
           .fontWeight(FontWeight.Bold)
           .width('100%')
 
-        Text(this.connected ? '状态：已连接 (uid 2000 / shell)' : '状态：未连接')
-          .fontSize(14)
-          .width('100%')
-          .fontColor(this.connected ? '#0a7d28' : '#8a8a8a')
+        Row() {
+          Text(this.connected
+            ? `状态：已连接 (uid 2000${this.debugPort > 0 ? ' · :' + this.debugPort : ''})`
+            : '状态：未开启或未连接开发者调试')
+            .fontSize(14)
+            .layoutWeight(1)
+            .fontColor(this.connected ? '#0a7d28' : '#b45309')
+
+          Button(this.connected ? '调试状态' : '配置向导')
+            .fontSize(12)
+            .height(28)
+            .backgroundColor(this.connected ? '#f0fdf4' : '#fffbeb')
+            .fontColor(this.connected ? '#15803d' : '#b45309')
+            .border({ width: 1, color: this.connected ? '#bbf7d0' : '#fde68a' })
+            .borderRadius(8)
+            .onClick(() => {
+              this.isDebugGuideOpen = true;
+            })
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
 
         if (!this.connected) {
           Column({ space: 10 }) {
+            Button('打开开发者调试引导向导', { type: ButtonType.Normal })
+              .height(40)
+              .borderRadius(8)
+              .backgroundColor('#0284c7')
+              .fontColor('#ffffff')
+              .onClick(() => {
+                this.isDebugGuideOpen = true;
+              })
+              .width('100%')
+
             Text('第 1 步：在「设置 → 系统 → 开发者选项」中开启「无线调试」。')
               .fontSize(13)
               .width('100%')
@@ -1898,21 +2065,26 @@ struct Index {
               .fontSize(13)
               .width('100%')
 
-            Button('自动发现端口')
+            Button('自动发现并连接')
               .enabled(!this.busy)
+              .backgroundColor('#f0f9ff')
+              .fontColor('#0284c7')
+              .border({ width: 1, color: '#bae6fd' })
               .onClick(() => { this.discover(); })
               .width('100%')
 
             TextInput({ text: this.host, placeholder: '127.0.0.1' })
               .onChange((value: string) => { this.host = value; })
               .width('100%')
-            TextInput({ text: this.port, placeholder: '8710' })
+            TextInput({ text: this.port, placeholder: '开发者选项中的 5 位端口' })
               .type(InputType.Number)
               .onChange((value: string) => { this.port = value; })
               .width('100%')
 
-            Button('连接设备')
+            Button('使用端口连接')
               .enabled(!this.busy)
+              .backgroundColor('#0f766e')
+              .fontColor('#ffffff')
               .onClick(() => { this.connect(); })
               .width('100%')
           }
@@ -3979,18 +4151,30 @@ struct Index {
 
       // 2. Subtle Floating Edge Pull-Tab to open SideDrawer (Zero obstruction to top header)
       if (!this.isDrawerOpen) {
-        Row() {
-          Text('›')
-            .fontSize(16)
-            .fontWeight(FontWeight.Bold)
-            .fontColor('#ffffff')
+        Stack({ alignContent: Alignment.TopEnd }) {
+          Row() {
+            Text('›')
+              .fontSize(16)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#ffffff')
+          }
+          .width(24)
+          .height(52)
+          .backgroundColor('rgba(15, 23, 42, 0.5)')
+          .borderRadius({ topRight: 14, bottomRight: 14, topLeft: 0, bottomLeft: 0 })
+          .justifyContent(FlexAlign.Center)
+          .alignItems(VerticalAlign.Center)
+
+          if (!this.connected && this.debugPhase !== 'checking') {
+            Circle({ width: 7, height: 7 })
+              .fill(this.debugPhase === 'auth_rejected' ? '#ef4444' : '#f59e0b')
+              .stroke('#ffffff')
+              .strokeWidth(1)
+              .margin({ top: 5, right: 4 })
+          }
         }
         .width(24)
         .height(52)
-        .backgroundColor('rgba(15, 23, 42, 0.5)')
-        .borderRadius({ topRight: 14, bottomRight: 14, topLeft: 0, bottomLeft: 0 })
-        .justifyContent(FlexAlign.Center)
-        .alignItems(VerticalAlign.Center)
         .position({ x: 0, y: '48%' })
         .shadow({ radius: 8, color: 'rgba(0, 0, 0, 0.2)', offsetX: 2, offsetY: 1 })
         .onClick(() => {
@@ -4014,6 +4198,8 @@ struct Index {
         isOpen: this.isDrawerOpen,
         shellConnected: this.connected,
         dshReady: this.isDshReady,
+        debugPhase: this.debugPhase,
+        debugPort: this.debugPort,
         currentActivePage: this.activeMainTab,
         onClose: () => {
           this.isDrawerOpen = false;
@@ -4043,6 +4229,45 @@ struct Index {
           } catch (e) {
             hilog.warn(0x0001, 'Index', 'loadUrl error: %{public}s', JSON.stringify(e));
           }
+        },
+        onOpenDebugGuide: () => {
+          this.isDrawerOpen = false;
+          this.isDebugGuideOpen = true;
+        }
+      })
+
+      // 5. Developer Debugging Setup Wizard & Status Modal
+      DeveloperDebugGuide({
+        isOpen: this.isDebugGuideOpen,
+        phase: this.debugPhase,
+        connected: this.connected,
+        host: this.host,
+        port: this.debugPort,
+        lastPort: this.debugLastPort,
+        lastError: this.debugLastError,
+        uidVerified: this.uidVerified,
+        uidInfo: this.uidInfo,
+        publicKey: this.publicKey,
+        isBusy: this.busy,
+        onClose: () => {
+          this.isDebugGuideOpen = false;
+        },
+        onAutoDetect: () => {
+          this.tryAutoConnect();
+        },
+        onManualConnect: (targetHost: string, targetPort: number) => {
+          this.host = targetHost;
+          this.port = String(targetPort);
+          this.connectWithTarget(targetHost, targetPort);
+        },
+        onOpenSettings: () => {
+          this.openSystemSettings();
+        },
+        onVerifyUid: () => {
+          this.verifyBridgeUid();
+        },
+        onDisconnect: () => {
+          this.disconnectBridge();
         }
       })
 

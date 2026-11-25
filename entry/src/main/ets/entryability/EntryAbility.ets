@@ -13,6 +13,7 @@ const DOMAIN: number = 0x3201;
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     AppStorage.setOrCreate('abilityContext', this.context);
+    AppStorage.setOrCreate('appForegroundTick', 0);
     BridgeController.getInstance().init(this.context);
     FloatWindowManager.getInstance().init(this.context);
     AgentWorkspace.getInstance().init(this.context);
@@ -41,6 +42,8 @@ export default class EntryAbility extends UIAbility {
 
   onForeground(): void {
     FloatWindowManager.getInstance().onAppForeground();
+    const prevTick = AppStorage.get<number>('appForegroundTick') ?? 0;
+    AppStorage.setOrCreate('appForegroundTick', prevTick + 1);
   }
 
   onBackground(): void {

@@ -11,6 +11,11 @@
  */
 
 import hilog from '@ohos.hilog';
+import {
+  DebugPhaseUiCopy,
+  getDebugPhaseSummary,
+  HdcDebugPhase
+} from '../common/HdcDebugState';
 
 @Component
 struct SideDrawerNavRow {
@@ -53,6 +58,8 @@ export struct SideDrawer {
   @Prop @Watch('onDrawerOpenChange') isOpen: boolean = false;
   @Prop shellConnected: boolean = false;
   @Prop dshReady: boolean = false;
+  @Prop debugPhase: HdcDebugPhase = 'checking';
+  @Prop debugPort: number = 0;
   @Prop @Watch('onCurrentActivePageChange') currentActivePage: string = 'dsh'; // 'console' | 'dsh' | 'browser'
   @State private activePage: string = 'dsh';
   @State private isAboutOpen: boolean = false;
@@ -60,6 +67,65 @@ export struct SideDrawer {
   onClose?: () => void = undefined;
   onSelectPage?: (page: 'console' | 'dsh' | 'browser') => void = undefined;
   onOpenUrl?: (url: string) => void = undefined;
+  onOpenDebugGuide?: () => void = undefined;
+
+  private getEffectivePhase(): HdcDebugPhase {
+    return this.shellConnected ? 'connected' : this.debugPhase;
+  }
+
+  private getDebugSummary(): DebugPhaseUiCopy {
+    return getDebugPhaseSummary(this.getEffectivePhase(), this.debugPort);
+  }
+
+  private getHeaderDotColor(): string {
+    const phase = this.getEffectivePhase();
+    if (phase === 'connected') {
+      return '#22c55e';
+    }
+    if (phase === 'auth_rejected') {
+      return '#ef4444';
+    }
+    if (phase === 'checking' || phase === 'awaiting_auth') {
+      return '#0284c7';
+    }
+    return '#f59e0b';
+  }
+
+  private getHeaderTextColor(): string {
+    const phase = this.getEffectivePhase();
+    if (phase === 'connected') {
+      return '#15803d';
+    }
+    if (phase === 'auth_rejected') {
+      return '#b91c1c';
+    }
+    if (phase === 'checking' || phase === 'awaiting_auth') {
+      return '#0369a1';
+    }
+    return '#b45309';
+  }
+
+  private getBadgeBgColor(): string {
+    const phase = this.getEffectivePhase();
+    if (phase === 'auth_rejected') {
+      return '#fee2e2';
+    }
+    if (phase === 'checking' || phase === 'awaiting_auth') {
+      return '#e0f2fe';
+    }
+    return '#fef3c7';
+  }
+
+  private getBadgeTextColor(): string {
+    const phase = this.getEffectivePhase();
+    if (phase === 'auth_rejected') {
+      return '#b91c1c';
+    }
+    if (phase === 'checking' || phase === 'awaiting_auth') {
+      return '#0369a1';
+    }
+    return '#b45309';
+  }
 
   aboutToAppear() {
     this.activePage = this.currentActivePage;
@@ -117,10 +183,12 @@ export struct SideDrawer {
 
             Row({ space: 4 }) {
               Circle({ width: 6, height: 6 })
-                .fill(this.shellConnected ? '#22c55e' : '#f59e0b')
-              Text(this.shellConnected ? '枢维智能 · 个人助理' : '服务连接中...')
+                .fill(this.getHeaderDotColor())
+              Text(this.getDebugSummary().headerText)
                 .fontSize(10)
-                .fontColor(this.shellConnected ? '#15803d' : '#b45309')
+                .fontColor(this.getHeaderTextColor())
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
           }
           .layoutWeight(1)
@@ -129,6 +197,11 @@ export struct SideDrawer {
         .width('100%')
         .padding({ left: 16, right: 16, top: 48, bottom: 20 })
         .alignItems(VerticalAlign.Center)
+        .onClick(() => {
+          if (this.onOpenDebugGuide) {
+            this.onOpenDebugGuide();
+          }
+        })
 
         Divider()
           .color('#f1f5f9')
@@ -177,6 +250,90 @@ export struct SideDrawer {
         }
         .width('100%')
         .padding({ left: 12, right: 12 })
+
+        // Plan A: Developer Debugging Guide Card (amber guide when not ready, compact green row when ready)
+        Column() {
+          if (!this.getDebugSummary().isReady) {
+            Column({ space: 6 }) {
+              Row({ space: 6 }) {
+                Text('🛠️')
+                  .fontSize(14)
+                Text(this.getDebugSummary().title)
+                  .fontSize(13)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor('#92400e')
+                  .layoutWeight(1)
+                Text(this.getDebugSummary().badgeText)
+                  .fontSize(10)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(this.getBadgeTextColor())
+                  .backgroundColor(this.getBadgeBgColor())
+                  .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+                  .borderRadius(10)
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Center)
+
+              Row({ space: 6 }) {
+                Text(this.getDebugSummary().subtitle)
+                  .fontSize(11)
+                  .fontColor('#78350f')
+                  .lineHeight(15)
+                  .layoutWeight(1)
+                Text(this.getDebugSummary().actionText)
+                  .fontSize(11)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor('#b45309')
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Bottom)
+            }
+            .width('100%')
+            .padding(12)
+            .backgroundColor('#fffbeb')
+            .borderRadius(12)
+            .border({ width: 1, color: '#fde68a' })
+            .onClick(() => {
+              if (this.onOpenDebugGuide) {
+                this.onOpenDebugGuide();
+              }
+            })
+          } else {
+            Row({ space: 8 }) {
+              Circle({ width: 7, height: 7 })
+                .fill('#22c55e')
+              Text('开发者调试')
+                .fontSize(13)
+                .fontWeight(FontWeight.Medium)
+                .fontColor('#166534')
+                .layoutWeight(1)
+              Text(this.getDebugSummary().badgeText)
+                .fontSize(10)
+                .fontWeight(FontWeight.Medium)
+                .fontColor('#15803d')
+                .backgroundColor('#dcfce7')
+                .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+                .borderRadius(10)
+              Text('›')
+                .fontSize(14)
+                .fontColor('#16a34a')
+            }
+            .width('100%')
+            .height(42)
+            .padding({ left: 12, right: 12 })
+            .backgroundColor('#f0fdf4')
+            .borderRadius(12)
+            .border({ width: 1, color: '#dcfce7' })
+            .alignItems(VerticalAlign.Center)
+            .onClick(() => {
+              if (this.onOpenDebugGuide) {
+                this.onOpenDebugGuide();
+              }
+            })
+          }
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 14 })
 
         Blank()
 

@@ -11,6 +11,7 @@
 #include "define_plus.h"
 #include "host_tcp.h"
 #include "discovery.h"
+#include "dsh_state.h"
 #include "hdc_crypto.h"
 #include "serial_struct.h"
 #include "tlv.h"
@@ -60,6 +61,10 @@ std::string BuildShellTlv(const std::string &bundleName, const std::string &comm
 
 DeviceSession::DeviceSession() : HdcSessionBase(true)
 {
+    wakeAsync_.data = this;
+    if (uv_async_init(&loopMain, &wakeAsync_, OnWakeAsync) == 0) {
+        wakeAsyncInit_ = true;
+    }
     StartLoop();
     Report("device session created");
 }
@@ -67,6 +72,41 @@ DeviceSession::DeviceSession() : HdcSessionBase(true)
 DeviceSession::~DeviceSession()
 {
     Disconnect();
+}
+
+void DeviceSession::OnWakeAsync(uv_async_t *handle)
+{
+    if (handle == nullptr || handle->data == nullptr) {
+        return;
+    }
+    auto *self = static_cast<DeviceSession *>(handle->data);
+    self->DrainPostQueue();
+}
+
+bool DeviceSession::PostToLoop(std::function<void()> fn)
+{
+    if (!wakeAsyncInit_ || !loopRunning_.load()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(postMutex_);
+        postQueue_.push_back(std::move(fn));
+    }
+    return uv_async_send(&wakeAsync_) == 0;
+}
+
+void DeviceSession::DrainPostQueue()
+{
+    std::deque<std::function<void()>> batch;
+    {
+        std::lock_guard<std::mutex> lock(postMutex_);
+        batch.swap(postQueue_);
+    }
+    for (auto &fn : batch) {
+        if (fn) {
+            fn();
+        }
+    }
 }
 
 void DeviceSession::StartLoop()
@@ -88,6 +128,14 @@ void DeviceSession::StopLoop()
 {
     if (!loopRunning_.load()) {
         return;
+    }
+    if (wakeAsyncInit_) {
+        PostToLoop([this]() {
+            if (!uv_is_closing(reinterpret_cast<uv_handle_t *>(&wakeAsync_))) {
+                uv_close(reinterpret_cast<uv_handle_t *>(&wakeAsync_), nullptr);
+            }
+        });
+        wakeAsyncInit_ = false;
     }
     /* Stops uv_run, which lets the loop thread fall out of WorkerPendding. */
     this->PostStopInstanceMessage(false);
@@ -116,104 +164,476 @@ void DeviceSession::ConnectAsync(const std::string &host, int port, const std::s
 {
     std::string cryptoError;
     if (!HdcCrypto::Instance().EnsureKeypair(keyDir, cryptoError)) {
-        FinishConnect(false, "client keypair unavailable: " + cryptoError);
+        ConnectResult res;
+        res.ok = false;
+        res.port = 0;
+        res.reason = "key_error";
+        res.error = "client keypair unavailable: " + cryptoError;
+        if (callback) {
+            callback(res);
+        }
+        ReportState(false, res.error);
         return;
+    }
+
+    CancelPendingConnect();
+
+    uint32_t oldSessionToFree = 0;
+    bool alreadyConnected = false;
+    ConnectResult alreadyResult;
+    std::string alreadyKey;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (handshakeOk_ && session_ != nullptr) {
+            if (port == 0 || port == connectedPort_) {
+                alreadyConnected = true;
+                alreadyResult.ok = true;
+                alreadyResult.port = connectedPort_;
+                alreadyResult.reason = "ok";
+                alreadyKey = connectKey_;
+            } else {
+                oldSessionToFree = session_->sessionId;
+                handshakeOk_ = false;
+                awaitingAuth_ = false;
+                connectedPort_ = 0;
+                session_ = nullptr;
+            }
+        }
+    }
+    if (alreadyConnected) {
+        if (callback) {
+            callback(alreadyResult);
+        }
+        ReportState(true, "connected to " + alreadyKey);
+        return;
+    }
+    if (oldSessionToFree != 0) {
+        FreeSession(oldSessionToFree);
+    }
+
+    std::string targetHost = host.empty() ? "127.0.0.1" : host;
+    if (targetHost == "localhost") {
+        targetHost = "127.0.0.1";
+    }
+
+    std::vector<int> candidatePorts;
+    bool isSingleExplicit = false;
+    if (port > 0) {
+        candidatePorts.assign(1, port);
+        isSingleExplicit = true;
+    } else {
+        std::vector<int> excludes = { 9222, 38081, 39001 };
+        const int dshPort = DshState::GetInstance().GetSnapshot().port;
+        if (dshPort > 0) {
+            excludes.push_back(dshPort);
+        }
+        candidatePorts = ListPrioritizedListeningPorts(excludes);
+        isSingleExplicit = false;
+        if (candidatePorts.empty()) {
+            ConnectResult res;
+            res.ok = false;
+            res.port = 0;
+            res.reason = "not_running";
+            res.error = "the device has no reachable TCP port to try";
+            if (callback) {
+                callback(res);
+            }
+            ReportState(false, res.error);
+            return;
+        }
+        Report("the device is listening on " + std::to_string(candidatePorts.size()) + " candidate ports, trying them");
     }
 
     keyDir_ = keyDir;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        host_ = targetHost;
+        candidates_ = std::move(candidatePorts);
+        candidateIndex_ = 0;
+        singleExplicitPort_ = isSingleExplicit;
+        lastCandidateError_.clear();
+        lastCandidateReason_.clear();
         connectCallback_ = callback;
         handshakeOk_ = false;
-        handshakeError_.clear();
+        connecting_ = true;
+        awaitingAuth_ = false;
+        connectedPort_ = 0;
+        attemptPort_ = 0;
+        currentAttemptSessionId_ = 0;
+        ++attemptGen_;
     }
 
-    if (tcpClient_ == nullptr) {
-        tcpClient_ = new HdcHostTCP(true, this);
-    }
+    TryNextCandidate();
+}
 
-    if (port > 0) {
-        candidates_.assign(1, port);
-    } else {
-        candidates_ = ListListeningPorts();
-        if (candidates_.empty()) {
-            FinishConnect(false, "the device has no reachable TCP port to try");
+void DeviceSession::CancelPendingConnect()
+{
+    uint32_t pendingSid = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!connecting_ && currentAttemptSessionId_ == 0) {
             return;
         }
-        Report("the device is listening on " + std::to_string(candidates_.size()) + " ports, trying them");
+        connecting_ = false;
+        awaitingAuth_ = false;
+        ++attemptGen_;
+        pendingSid = currentAttemptSessionId_;
+        currentAttemptSessionId_ = 0;
+        if (!handshakeOk_) {
+            session_ = nullptr;
+        }
+        connectCallback_ = nullptr;
     }
-    candidateIndex_ = 0;
-    TryNextCandidate();
+    if (pendingSid != 0) {
+        FreeSession(pendingSid);
+    }
 }
 
 void DeviceSession::TryNextCandidate()
 {
-    if (candidateIndex_ >= candidates_.size()) {
-        FinishConnect(false, "none of the device's listening ports spoke the hdc protocol");
+    struct AttemptCtx {
+        DeviceSession *self = nullptr;
+        uint64_t expectedGen = 0;
+        int port = 0;
+        int probeTimeoutMs = 1800;
+        std::string connectKey;
+    };
+
+    AttemptCtx *attempt = nullptr;
+    bool shouldFinish = false;
+    ConnectResult finishResult;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!connecting_) {
+            return;
+        }
+        if (candidateIndex_ >= candidates_.size()) {
+            shouldFinish = true;
+            finishResult.ok = false;
+            finishResult.port = (singleExplicitPort_ && !candidates_.empty()) ? candidates_[0] : 0;
+            if (singleExplicitPort_) {
+                finishResult.reason = lastCandidateReason_.empty() ? "not_running" : lastCandidateReason_;
+                finishResult.error = lastCandidateError_.empty()
+                    ? ("failed to connect to " + host_ + ":" + std::to_string(finishResult.port))
+                    : lastCandidateError_;
+            } else {
+                finishResult.reason = "not_running";
+                finishResult.error = "none of the device's listening ports spoke the hdc protocol";
+            }
+        } else {
+            const int port = candidates_[candidateIndex_++];
+            attemptPort_ = port;
+            awaitingAuth_ = false;
+            currentAttemptSessionId_ = 0;
+            const uint64_t expectedGen = ++attemptGen_;
+            connectKey_ = host_ + ":" + std::to_string(port);
+
+            attempt = new AttemptCtx();
+            attempt->self = this;
+            attempt->expectedGen = expectedGen;
+            attempt->port = port;
+            attempt->probeTimeoutMs = singleExplicitPort_ ? 4000 : 800;
+            attempt->connectKey = connectKey_;
+        }
+    }
+
+    if (shouldFinish) {
+        FinishConnect(finishResult);
         return;
     }
-    const int port = candidates_[candidateIndex_++];
-    connectKey_ = "127.0.0.1:" + std::to_string(port);
 
     /*
      * The connect has to be issued from the loop thread: uv_tcp_connect is
      * not thread safe, and a connect issued from anywhere else is queued
      * and never sent.
      */
-    Hdc::Base::DoNextLoop(&loopMain, this, [](const uint8_t flag, std::string &msg, const void *data) {
-        auto *self = const_cast<DeviceSession *>(static_cast<const DeviceSession *>(data));
-        self->session_ = self->tcpClient_->ConnectDaemon(self->connectKey_, false);
-        if (self->session_ == nullptr) {
-            self->FinishConnect(false, "failed to open a TCP session to " + self->connectKey_);
-        }
-    });
+    const uint64_t expectedGen = attempt->expectedGen;
+    const int attemptPort = attempt->port;
+    const int probeTimeoutMs = attempt->probeTimeoutMs;
+    const std::string connectKey = attempt->connectKey;
+    delete attempt;
+
+    if (!PostToLoop([this, expectedGen, attemptPort, probeTimeoutMs, connectKey]() {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!connecting_ || attemptGen_ != expectedGen) {
+                    return;
+                }
+            }
+
+            if (tcpClient_ == nullptr) {
+                tcpClient_ = new HdcHostTCP(true, this);
+            }
+
+            Hdc::HSession s = tcpClient_->ConnectDaemon(connectKey, false);
+            if (s == nullptr) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (!connecting_ || attemptGen_ != expectedGen) {
+                        return;
+                    }
+                    lastCandidateReason_ = "not_running";
+                    lastCandidateError_ = "failed to open a TCP session to " + connectKey;
+                }
+                TryNextCandidate();
+                return;
+            }
+
+            bool cancelled = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!connecting_ || attemptGen_ != expectedGen) {
+                    cancelled = true;
+                } else {
+                    currentAttemptSessionId_ = s->sessionId;
+                    session_ = s;
+                }
+            }
+            if (cancelled) {
+                FreeSession(s->sessionId);
+                return;
+            }
+
+            struct ProbeTimeoutCtx {
+                DeviceSession *self = nullptr;
+                uint64_t expectedGen = 0;
+                uint32_t sessionId = 0;
+                int port = 0;
+            };
+            auto *timeoutCtx = new ProbeTimeoutCtx{ this, expectedGen, s->sessionId, attemptPort };
+            if (!Hdc::Base::DelayDo(&loopMain, probeTimeoutMs, 0, "", timeoutCtx,
+                                    [](const uint8_t, std::string &, const void *tData) {
+                                        std::unique_ptr<ProbeTimeoutCtx> tc(
+                                            const_cast<ProbeTimeoutCtx *>(static_cast<const ProbeTimeoutCtx *>(tData)));
+                                        tc->self->OnProbeTimeout(tc->expectedGen, tc->sessionId, tc->port);
+                                    })) {
+                delete timeoutCtx;
+            }
+        })) {
+        ConnectResult res;
+        res.ok = false;
+        res.port = attemptPort;
+        res.reason = "error";
+        res.error = "failed to schedule TCP connect on session loop";
+        FinishConnect(res);
+    }
 }
 
-void DeviceSession::FinishConnect(bool ok, const std::string &error)
+void DeviceSession::OnProbeTimeout(uint64_t expectedGen, uint32_t timedOutSid, int attemptPort)
 {
-    /*
-     * A failed handshake on one port just means that port is not the hdc
-     * daemon; if there are more candidates, try the next one.
-     */
-    if (!ok && candidateIndex_ < candidates_.size() && !handshakeError_.empty()) {
-        Report("port " + connectKey_ + " did not answer the hdc handshake: " + handshakeError_);
-        handshakeError_.clear();
-        TryNextCandidate();
+    bool shouldAdvance = false;
+    bool hasMore = false;
+    bool wasSingle = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!connecting_ || attemptGen_ != expectedGen || awaitingAuth_ || handshakeOk_) {
+            return;
+        }
+        shouldAdvance = true;
+        ++attemptGen_;
+        if (currentAttemptSessionId_ == timedOutSid) {
+            currentAttemptSessionId_ = 0;
+            session_ = nullptr;
+        }
+        lastCandidateReason_ = "connect_timeout";
+        lastCandidateError_ = "timed out waiting for hdc handshake banner on " + connectKey_;
+        hasMore = (candidateIndex_ < candidates_.size());
+        wasSingle = singleExplicitPort_;
+    }
+
+    if (!shouldAdvance) {
         return;
     }
 
+    FreeSession(timedOutSid);
+    if (hasMore) {
+        TryNextCandidate();
+    } else {
+        ConnectResult res;
+        res.ok = false;
+        res.port = wasSingle ? attemptPort : 0;
+        res.reason = wasSingle ? "connect_timeout" : "not_running";
+        res.error = wasSingle
+            ? ("timed out waiting for hdc handshake on port " + std::to_string(attemptPort))
+            : "none of the device's listening ports spoke the hdc protocol";
+        FinishConnect(res);
+    }
+}
+
+void DeviceSession::FinishConnect(const ConnectResult &result)
+{
     ConnectCallback callback;
+    std::string keyCopy;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (ok) {
-            handshakeOk_ = true;
-            handshakeError_.clear();
-        } else if (handshakeError_.empty()) {
-            handshakeError_ = error;
+        if (!connecting_ && connectCallback_ == nullptr) {
+            return;
         }
+        connecting_ = false;
+        awaitingAuth_ = false;
+        currentAttemptSessionId_ = 0;
+        if (result.ok) {
+            handshakeOk_ = true;
+            connectedPort_ = result.port;
+        } else {
+            handshakeOk_ = false;
+            connectedPort_ = 0;
+            session_ = nullptr;
+        }
+        keyCopy = connectKey_;
         callback = connectCallback_;
         connectCallback_ = nullptr;
     }
     if (callback) {
-        callback(ok, ok ? std::string() : error);
+        callback(result);
     }
-    ReportState(ok, ok ? ("connected to " + connectKey_) : error);
+    ReportState(result.ok, result.ok ? ("connected to " + keyCopy) : result.error);
+}
+
+void DeviceSession::NotifyInstanceSessionFree(HSession hSession, bool freeOrClear)
+{
+    if (freeOrClear || hSession == nullptr) {
+        return;
+    }
+
+    const uint32_t sid = hSession->sessionId;
+    const std::string faultInfo = hSession->GetConnectionError();
+
+    bool activeDisconnected = false;
+    bool attemptFailed = false;
+    bool wasAwaitingAuth = false;
+    bool hasMore = false;
+    bool wasSingle = false;
+    int attemptPort = 0;
+    std::string attemptKey;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (handshakeOk_ && session_ == hSession) {
+            handshakeOk_ = false;
+            awaitingAuth_ = false;
+            connectedPort_ = 0;
+            session_ = nullptr;
+            activeDisconnected = true;
+        } else if (connecting_ && currentAttemptSessionId_ == sid) {
+            attemptFailed = true;
+            wasAwaitingAuth = awaitingAuth_;
+            attemptPort = attemptPort_;
+            attemptKey = connectKey_;
+            wasSingle = singleExplicitPort_;
+            ++attemptGen_;
+            currentAttemptSessionId_ = 0;
+            session_ = nullptr;
+            awaitingAuth_ = false;
+
+            if (!wasAwaitingAuth) {
+                if (!faultInfo.empty()) {
+                    lastCandidateError_ = faultInfo + " (" + attemptKey + ")";
+                } else {
+                    lastCandidateError_ = "failed to connect to " + attemptKey;
+                }
+                lastCandidateReason_ = "not_running";
+                hasMore = (candidateIndex_ < candidates_.size());
+            }
+        }
+    }
+
+    if (activeDisconnected) {
+        {
+            std::lock_guard<std::mutex> execLock(execMutex_);
+            if (pendingChannelId_ != 0) {
+                pendingDisconnected_ = true;
+                pendingDone_ = true;
+            }
+        }
+        execCv_.notify_all();
+        Report("device session disconnected");
+        ReportState(false, "disconnected from device");
+        return;
+    }
+
+    if (!attemptFailed) {
+        return;
+    }
+
+    if (wasAwaitingAuth) {
+        ConnectResult res;
+        res.ok = false;
+        res.port = attemptPort;
+        res.reason = "auth_rejected";
+        res.error = faultInfo.empty()
+            ? "device authorization was rejected or interrupted"
+            : ("device authorization rejected: " + faultInfo);
+        FinishConnect(res);
+        return;
+    }
+
+    if (hasMore) {
+        TryNextCandidate();
+    } else {
+        ConnectResult res;
+        res.ok = false;
+        res.port = wasSingle ? attemptPort : 0;
+        res.reason = "not_running";
+        if (wasSingle) {
+            res.error = faultInfo.empty()
+                ? ("failed to connect to " + attemptKey)
+                : ("failed to connect to " + attemptKey + ": " + faultInfo);
+        } else {
+            res.error = "none of the device's listening ports spoke the hdc protocol";
+        }
+        FinishConnect(res);
+    }
 }
 
 void DeviceSession::Disconnect()
 {
+    CancelPendingConnect();
+    uint32_t activeSid = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        handshakeOk_ = false;
+        awaitingAuth_ = false;
+        connectedPort_ = 0;
+        if (session_ != nullptr) {
+            activeSid = session_->sessionId;
+            session_ = nullptr;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> execLock(execMutex_);
+        if (pendingChannelId_ != 0) {
+            pendingDisconnected_ = true;
+            pendingDone_ = true;
+        }
+    }
+    execCv_.notify_all();
+    if (activeSid != 0) {
+        FreeSession(activeSid);
+    }
+    StopLoop();
     if (tcpClient_ != nullptr) {
         delete tcpClient_;
         tcpClient_ = nullptr;
     }
-    session_ = nullptr;
-    StopLoop();
 }
 
 bool DeviceSession::IsReady() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return handshakeOk_;
+    return handshakeOk_ && session_ != nullptr;
+}
+
+SessionStateSnapshot DeviceSession::GetSessionState() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    SessionStateSnapshot snap;
+    snap.connected = handshakeOk_ && session_ != nullptr;
+    snap.connecting = connecting_;
+    snap.awaitingAuth = awaitingAuth_;
+    snap.port = snap.connected ? connectedPort_ : (connecting_ ? attemptPort_ : 0);
+    return snap;
 }
 
 bool DeviceSession::SendHandshake(HSession hSession, const uint32_t channelId, uint8_t authType,
@@ -223,7 +643,7 @@ bool DeviceSession::SendHandshake(HSession hSession, const uint32_t channelId, u
     handshake.banner = Hdc::HANDSHAKE_MESSAGE;
     handshake.authType = authType;
     handshake.sessionId = hSession->sessionId;
-    handshake.connectKey = connectKey_;
+    handshake.connectKey = hSession->connectKey;
     handshake.buf = buf;
     handshake.version = Hdc::Base::GetVersion();
 
@@ -245,7 +665,19 @@ bool DeviceSession::HandleHandshake(HSession hSession, const uint32_t channelId,
     Hdc::SerialStruct::ParseFromString(handshake, std::string(reinterpret_cast<char *>(payload), payloadSize));
 
     if (handshake.banner == Hdc::HANDSHAKE_FAILED) {
-        FinishConnect(false, "the device refused the handshake");
+        int port = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            port = attemptPort_;
+            ++attemptGen_;
+            currentAttemptSessionId_ = 0;
+        }
+        ConnectResult res;
+        res.ok = false;
+        res.port = port;
+        res.reason = "auth_rejected";
+        res.error = "the device refused the handshake";
+        FinishConnect(res);
         return false;
     }
     if (handshake.banner != Hdc::HANDSHAKE_MESSAGE) {
@@ -264,7 +696,19 @@ bool DeviceSession::HandleHandshake(HSession hSession, const uint32_t channelId,
             if (Hdc::Base::TlvToStringMap(handshake.buf, tlvMap)) {
                 auto it = tlvMap.find(TAG_AUTH_TYPE);
                 if (it != tlvMap.end() && it->second != std::to_string(Hdc::AuthVerifyType::RSA_3072_SHA512)) {
-                    FinishConnect(false, "the device only supports the legacy RSA auth mode");
+                    int port = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        port = attemptPort_;
+                        ++attemptGen_;
+                        currentAttemptSessionId_ = 0;
+                    }
+                    ConnectResult res;
+                    res.ok = false;
+                    res.port = port;
+                    res.reason = "unsupported_auth";
+                    res.error = "the device only supports the legacy RSA auth mode";
+                    FinishConnect(res);
                     return false;
                 }
             }
@@ -272,8 +716,26 @@ bool DeviceSession::HandleHandshake(HSession hSession, const uint32_t channelId,
             info += kHostDaemonBufSeparator;
             info += HdcCrypto::Instance().PublicKeyPem();
             if (!SendHandshake(hSession, channelId, HdcSessionBase::AUTH_PUBLICKEY, info)) {
-                FinishConnect(false, "failed to send our public key");
+                int port = 0;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    port = attemptPort_;
+                    ++attemptGen_;
+                    currentAttemptSessionId_ = 0;
+                }
+                ConnectResult res;
+                res.ok = false;
+                res.port = port;
+                res.reason = "error";
+                res.error = "failed to send our public key";
+                FinishConnect(res);
                 return false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (connecting_ && currentAttemptSessionId_ == hSession->sessionId) {
+                    awaitingAuth_ = true;
+                }
             }
             Report("sent our public key to the device");
             return true;
@@ -283,19 +745,59 @@ bool DeviceSession::HandleHandshake(HSession hSession, const uint32_t channelId,
             std::string signature;
             std::string signError;
             if (!HdcCrypto::Instance().SignToken(handshake.buf, signature, signError)) {
-                FinishConnect(false, "failed to sign the device challenge: " + signError);
+                int port = 0;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    port = attemptPort_;
+                    ++attemptGen_;
+                    currentAttemptSessionId_ = 0;
+                }
+                ConnectResult res;
+                res.ok = false;
+                res.port = port;
+                res.reason = "key_error";
+                res.error = "failed to sign the device challenge: " + signError;
+                FinishConnect(res);
                 return false;
             }
             if (!SendHandshake(hSession, channelId, HdcSessionBase::AUTH_SIGNATURE, signature)) {
-                FinishConnect(false, "failed to send our signature");
+                int port = 0;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    port = attemptPort_;
+                    ++attemptGen_;
+                    currentAttemptSessionId_ = 0;
+                }
+                ConnectResult res;
+                res.ok = false;
+                res.port = port;
+                res.reason = "error";
+                res.error = "failed to send our signature";
+                FinishConnect(res);
                 return false;
             }
             Report("signed the device challenge");
             return true;
         }
         case HdcSessionBase::AUTH_OK: {
-            session_ = hSession;
-            FinishConnect(true, std::string());
+            int port = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!connecting_ || currentAttemptSessionId_ != hSession->sessionId) {
+                    return false;
+                }
+                session_ = hSession;
+                port = attemptPort_;
+                connectedPort_ = port;
+                awaitingAuth_ = false;
+                currentAttemptSessionId_ = 0;
+                ++attemptGen_;
+            }
+            ConnectResult res;
+            res.ok = true;
+            res.port = port;
+            res.reason = "ok";
+            FinishConnect(res);
             return true;
         }
         default:
@@ -367,16 +869,9 @@ void DeviceSession::SendChannelClose(uint32_t sessionId, uint32_t channelId)
     if (channelId == 0 || !loopRunning_.load()) {
         return;
     }
-    struct CloseCtx {
-        DeviceSession *self = nullptr;
-        uint32_t sessionId = 0;
-        uint32_t channelId = 0;
-    };
-    CloseCtx *ctx = new CloseCtx{this, sessionId, channelId};
-    Hdc::Base::DoNextLoop(&loopMain, ctx, [](const uint8_t, std::string &, const void *data) {
-        std::unique_ptr<CloseCtx> c(const_cast<CloseCtx *>(static_cast<const CloseCtx *>(data)));
+    PostToLoop([this, sessionId, channelId]() {
         uint8_t count = 1;
-        c->self->Send(c->sessionId, c->channelId, Hdc::CMD_KERNEL_CHANNEL_CLOSE, &count, 1);
+        Send(sessionId, channelId, Hdc::CMD_KERNEL_CHANNEL_CLOSE, &count, 1);
     });
 }
 
@@ -384,9 +879,14 @@ bool DeviceSession::Exec(const std::string &command, const std::string &bundleNa
                          unsigned timeoutSeconds, StreamChunkCallback onChunk)
 {
     std::lock_guard<std::mutex> serializeLock(execSerializeMutex_);
-    if (!IsReady() || session_ == nullptr) {
-        result.error = "not connected to the device";
-        return false;
+    uint32_t activeSessionId = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!handshakeOk_ || session_ == nullptr) {
+            result.error = "not connected to the device";
+            return false;
+        }
+        activeSessionId = session_->sessionId;
     }
 
     uint16_t cmdFlag = Hdc::CMD_UNITY_EXECUTE;
@@ -411,6 +911,7 @@ bool DeviceSession::Exec(const std::string &command, const std::string &bundleNa
         pendingOutput_.clear();
         pendingDone_ = false;
         pendingAborted_ = false;
+        pendingDisconnected_ = false;
         streamChunkSink_ = onChunk;
     }
 
@@ -427,22 +928,27 @@ bool DeviceSession::Exec(const std::string &command, const std::string &bundleNa
     };
     auto ctx = std::make_shared<SendCtx>();
     ctx->self = this;
-    ctx->sessionId = session_->sessionId;
+    ctx->sessionId = activeSessionId;
     ctx->channelId = channelId;
     ctx->cmdFlag = cmdFlag;
     ctx->payload = std::move(payload);
 
-    Hdc::Base::DoNextLoop(&loopMain, ctx.get(), [](const uint8_t, std::string &, const void *data) {
-        auto *c = const_cast<SendCtx *>(static_cast<const SendCtx *>(data));
-        c->sendRet = c->self->Send(c->sessionId, c->channelId, c->cmdFlag,
-                                   reinterpret_cast<const uint8_t *>(c->payload.data()),
-                                   static_cast<int>(c->payload.size()));
-        {
-            std::lock_guard<std::mutex> lock(c->mtx);
-            c->done = true;
-        }
-        c->cv.notify_all();
-    });
+    if (!PostToLoop([ctx]() {
+            ctx->sendRet = ctx->self->Send(ctx->sessionId, ctx->channelId, ctx->cmdFlag,
+                                           reinterpret_cast<const uint8_t *>(ctx->payload.data()),
+                                           static_cast<int>(ctx->payload.size()));
+            {
+                std::lock_guard<std::mutex> lock(ctx->mtx);
+                ctx->done = true;
+            }
+            ctx->cv.notify_all();
+        })) {
+        std::lock_guard<std::mutex> lock(execMutex_);
+        pendingChannelId_ = 0;
+        streamChunkSink_ = nullptr;
+        result.error = "failed to schedule command execution";
+        return false;
+    }
 
     {
         std::unique_lock<std::mutex> lock(ctx->mtx);
@@ -459,6 +965,7 @@ bool DeviceSession::Exec(const std::string &command, const std::string &bundleNa
 
     bool timedOut = false;
     bool wasAborted = false;
+    bool wasDisconnected = false;
     uint32_t sessionId = ctx->sessionId;
     {
         std::unique_lock<std::mutex> lock(execMutex_);
@@ -473,6 +980,7 @@ bool DeviceSession::Exec(const std::string &command, const std::string &bundleNa
         }
         result.output = pendingOutput_;
         wasAborted = pendingAborted_;
+        wasDisconnected = pendingDisconnected_;
         pendingChannelId_ = 0;
         streamChunkSink_ = nullptr;
     }
@@ -481,6 +989,12 @@ bool DeviceSession::Exec(const std::string &command, const std::string &bundleNa
         result.ok = false;
         result.exitCode = -130;
         result.error = "命令已由用户中断 (SIGINT)";
+        return false;
+    }
+    if (wasDisconnected) {
+        result.ok = false;
+        result.exitCode = -1;
+        result.error = "connection lost while executing command";
         return false;
     }
     if (timedOut) {
@@ -498,15 +1012,20 @@ bool DeviceSession::Exec(const std::string &command, const std::string &bundleNa
 
 bool DeviceSession::Abort()
 {
-    uint32_t channelId = 0;
     uint32_t sessionId = 0;
     {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (session_ != nullptr) {
+            sessionId = session_->sessionId;
+        }
+    }
+    uint32_t channelId = 0;
+    {
         std::lock_guard<std::mutex> lock(execMutex_);
-        if (pendingChannelId_ == 0 || session_ == nullptr) {
+        if (pendingChannelId_ == 0 || sessionId == 0) {
             return false;
         }
         channelId = pendingChannelId_;
-        sessionId = session_->sessionId;
         pendingAborted_ = true;
         pendingDone_ = true;
     }

@@ -273,7 +273,7 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
             setenv("HOME", options.workspace_root.c_str(), 1);
             setenv("DSH_HOME", dsh_dir.c_str(), 1);
 
-            // Write $DSH_HOME/cordis.patch.yml so DSH automatically loads Swai & PiHA tools/mcp
+            // Write $DSH_HOME/cordis.patch.yml so DSH automatically loads Swai tools/mcp
             std::string home_patch_yml = dsh_dir + "/cordis.patch.yml";
             std::string tools_mjs = options.runtime_root + "/bridge/swai-tools.mjs";
             FILE* hpf = fopen(home_patch_yml.c_str(), "w");
@@ -287,12 +287,6 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                     "      config:\n"
                     "        transport: \"streamable-http\"\n"
                     "        serverName: \"swai\"\n"
-                    "        url: \"http://127.0.0.1:39001/mcp\"\n"
-                    "    - id: piha-mcp\n"
-                    "      name: \"@deepseek-ai/dsh-mcp-client\"\n"
-                    "      config:\n"
-                    "        transport: \"streamable-http\"\n"
-                    "        serverName: \"piha\"\n"
                     "        url: \"http://127.0.0.1:39001/mcp\"\n",
                     tools_mjs.c_str());
                 fclose(hpf);
@@ -865,7 +859,6 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
             if (access(alt.c_str(), R_OK) == 0) bin_path = alt;
         }
 
-        std::string patch_json = options.runtime_root + "/bridge/swai-host.patch.json";
         std::vector<std::string> args = {
             "node",
             "--jitless",
@@ -875,8 +868,6 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
             preload_js,
             bin_path,
             "web",
-            "--patch",
-            patch_json,
             "--host",
             "127.0.0.1",
             "--port",

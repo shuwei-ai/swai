@@ -8,6 +8,7 @@ import ticketStateMachineTest from './TicketStateMachine.test';
 import asyncDispatchWaitOnTest from './AsyncDispatchWaitOn.test';
 import inlineSpillAntiLoopTest from './InlineSpillAntiLoop.test';
 import terminalEnhancementTest from './TerminalEnhancement.test';
+import developerDebugGuideTest from './DeveloperDebugGuide.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -20,5 +21,6 @@ export default function testsuite() {
   asyncDispatchWaitOnTest();
   inlineSpillAntiLoopTest();
   terminalEnhancementTest();
+  developerDebugGuideTest();
 }
 

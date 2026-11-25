@@ -112,16 +112,19 @@ napi_value Init(napi_env env, napi_callback_info info)
 
 /* --- connect (async) -------------------------------------------------- */
 
+struct ConnectSharedState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    swshell::ConnectResult result;
+};
+
 struct ConnectTask {
     napi_async_work work = nullptr;
     napi_deferred deferred = nullptr;
     std::string host;
     int port = 0;
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool done = false;
-    bool ok = false;
-    std::string error;
+    std::shared_ptr<ConnectSharedState> state = std::make_shared<ConnectSharedState>();
 };
 
 /*
@@ -131,38 +134,48 @@ struct ConnectTask {
 void ConnectExecute(napi_env env, void *data)
 {
     ConnectTask *task = static_cast<ConnectTask *>(data);
+    std::shared_ptr<ConnectSharedState> state = task->state;
     swshell::DeviceSession *session = EnsureSession();
-    session->ConnectAsync(task->host, task->port, gKeyDir, [task](bool ok, const std::string &error) {
+    session->ConnectAsync(task->host, task->port, gKeyDir, [state](const swshell::ConnectResult &res) {
         {
-            std::lock_guard<std::mutex> lock(task->mutex);
-            task->ok = ok;
-            task->error = error;
-            task->done = true;
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->done) {
+                state->result = res;
+                state->done = true;
+            }
         }
-        task->cv.notify_all();
+        state->cv.notify_all();
     });
-    std::unique_lock<std::mutex> lock(task->mutex);
-    task->cv.wait_for(lock, std::chrono::seconds(25), [task] { return task->done; });
-    if (!task->done) {
-        task->ok = false;
-        task->error = "timed out waiting for the device handshake";
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->cv.wait_for(lock, std::chrono::seconds(25), [&state] { return state->done; });
+    if (!state->done) {
+        swshell::SessionStateSnapshot snap = session->GetSessionState();
+        state->result.ok = false;
+        state->result.port = snap.port;
+        if (snap.awaitingAuth) {
+            state->result.reason = "auth_timeout";
+            state->result.error = "timed out waiting for device authorization dialog";
+        } else {
+            state->result.reason = "connect_timeout";
+            state->result.error = "timed out waiting for the device handshake";
+        }
+        state->done = true;
+        lock.unlock();
+        session->CancelPendingConnect();
     }
 }
 
 void ConnectComplete(napi_env env, napi_status status, void *data)
 {
     ConnectTask *task = static_cast<ConnectTask *>(data);
-    napi_value result = nullptr;
-    if (task->ok) {
-        napi_get_boolean(env, true, &result);
-    } else {
-        napi_value object = nullptr;
-        napi_create_object(env, &object);
-        napi_set_named_property(env, object, "ok", MakeBool(env, false));
-        napi_set_named_property(env, object, "error", MakeString(env, task->error));
-        result = object;
-    }
-    napi_resolve_deferred(env, task->deferred, result);
+    const swshell::ConnectResult &res = task->state->result;
+    napi_value object = nullptr;
+    napi_create_object(env, &object);
+    napi_set_named_property(env, object, "ok", MakeBool(env, res.ok));
+    napi_set_named_property(env, object, "port", MakeInt32(env, res.port));
+    napi_set_named_property(env, object, "reason", MakeString(env, res.reason));
+    napi_set_named_property(env, object, "error", MakeString(env, res.error));
+    napi_resolve_deferred(env, task->deferred, object);
     napi_delete_async_work(env, task->work);
     delete task;
 }
@@ -173,7 +186,17 @@ napi_value Connect(napi_env env, napi_callback_info info)
     napi_value argv[2] = {nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 2) {
-        return MakeBool(env, false);
+        napi_deferred deferred = nullptr;
+        napi_value promise = nullptr;
+        napi_create_promise(env, &deferred, &promise);
+        napi_value object = nullptr;
+        napi_create_object(env, &object);
+        napi_set_named_property(env, object, "ok", MakeBool(env, false));
+        napi_set_named_property(env, object, "port", MakeInt32(env, 0));
+        napi_set_named_property(env, object, "reason", MakeString(env, "error"));
+        napi_set_named_property(env, object, "error", MakeString(env, "missing host or port"));
+        napi_resolve_deferred(env, deferred, object);
+        return promise;
     }
 
     size_t len = 0;
@@ -433,17 +456,11 @@ void DiscoverExecute(napi_env env, void *data)
 void DiscoverComplete(napi_env env, napi_status status, void *data)
 {
     DiscoverTask *task = static_cast<DiscoverTask *>(data);
-    if (task->port > 0) {
-        napi_value result = nullptr;
-        napi_create_int32(env, task->port, &result);
-        napi_resolve_deferred(env, task->deferred, result);
-    } else {
-        napi_value object = nullptr;
-        napi_create_object(env, &object);
-        napi_set_named_property(env, object, "port", MakeInt32(env, 0));
-        napi_set_named_property(env, object, "error", MakeString(env, task->error));
-        napi_resolve_deferred(env, task->deferred, object);
-    }
+    napi_value object = nullptr;
+    napi_create_object(env, &object);
+    napi_set_named_property(env, object, "port", MakeInt32(env, task->port));
+    napi_set_named_property(env, object, "error", MakeString(env, task->port > 0 ? std::string() : task->error));
+    napi_resolve_deferred(env, task->deferred, object);
     napi_delete_async_work(env, task->work);
     delete task;
 }
@@ -523,6 +540,21 @@ napi_value Disconnect(napi_env env, napi_callback_info info)
 napi_value IsConnected(napi_env env, napi_callback_info info)
 {
     return MakeBool(env, gSession != nullptr && gSession->IsReady());
+}
+
+napi_value GetSessionState(napi_env env, napi_callback_info info)
+{
+    swshell::SessionStateSnapshot snap;
+    if (gSession != nullptr) {
+        snap = gSession->GetSessionState();
+    }
+    napi_value object = nullptr;
+    napi_create_object(env, &object);
+    napi_set_named_property(env, object, "connected", MakeBool(env, snap.connected));
+    napi_set_named_property(env, object, "connecting", MakeBool(env, snap.connecting));
+    napi_set_named_property(env, object, "awaitingAuth", MakeBool(env, snap.awaitingAuth));
+    napi_set_named_property(env, object, "port", MakeInt32(env, snap.port));
+    return object;
 }
 
 /* --- public key -------------------------------------------------------- */
@@ -988,6 +1020,7 @@ napi_value InitAll(napi_env env, napi_value exports)
         { "discover", nullptr, Discover, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "listPorts", nullptr, ListPorts, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "isConnected", nullptr, IsConnected, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "getSessionState", nullptr, GetSessionState, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "publicKey", nullptr, PublicKey, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "runJs", nullptr, RunJs, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "runPython", nullptr, RunPython, nullptr, nullptr, nullptr, napi_default, nullptr },

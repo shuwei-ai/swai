@@ -14,9 +14,28 @@ export interface ShellExecResult {
   exitCode: number;
 }
 
+export type ShellConnectReason =
+  'ok' |
+  'not_running' |
+  'auth_rejected' |
+  'auth_timeout' |
+  'connect_timeout' |
+  'key_error' |
+  'unsupported_auth' |
+  'error';
+
 export interface ShellConnectResult {
   ok: boolean;
+  port: number;
+  reason: string;
   error: string;
+}
+
+export interface ShellSessionState {
+  connected: boolean;
+  connecting: boolean;
+  awaitingAuth: boolean;
+  port: number;
 }
 
 export interface ShellDiscoveryResult {
@@ -114,8 +133,38 @@ export function initNative(keyDir: string): boolean {
  * point; the user has to allow it.
  */
 export async function connectNative(host: string, port: number): Promise<ShellConnectResult> {
-  const result = await swshell.connect(host, port) as ShellConnectResult;
-  return result;
+  const raw = await swshell.connect(host, port) as ShellConnectResult | boolean | null | undefined;
+  if (typeof raw === 'boolean') {
+    return {
+      ok: raw,
+      port: raw && port > 0 ? port : 0,
+      reason: raw ? 'ok' : 'error',
+      error: raw ? '' : 'connection failed'
+    };
+  }
+  if (raw && typeof raw === 'object') {
+    const resObj = raw as ShellConnectResult;
+    const ok = resObj.ok === true;
+    const resolvedPort = typeof resObj.port === 'number' && Number.isFinite(resObj.port) && resObj.port > 0
+      ? resObj.port
+      : (ok && port > 0 ? port : 0);
+    const reason = typeof resObj.reason === 'string' && resObj.reason.length > 0
+      ? resObj.reason
+      : (ok ? 'ok' : 'error');
+    const error = typeof resObj.error === 'string' ? resObj.error : '';
+    return {
+      ok: ok,
+      port: resolvedPort,
+      reason: reason,
+      error: error
+    };
+  }
+  return {
+    ok: false,
+    port: 0,
+    reason: 'error',
+    error: 'invalid connect response'
+  };
 }
 
 /**
@@ -133,6 +182,29 @@ export function disconnectNative(): boolean {
 
 export function isConnectedNative(): boolean {
   return swshell.isConnected();
+}
+
+export function getSessionStateNative(): ShellSessionState {
+  try {
+    const raw = swshell.getSessionState() as ShellSessionState | null | undefined;
+    if (raw && typeof raw === 'object') {
+      const portVal = typeof raw.port === 'number' && Number.isFinite(raw.port) && raw.port > 0 ? raw.port : 0;
+      return {
+        connected: raw.connected === true,
+        connecting: raw.connecting === true,
+        awaitingAuth: raw.awaitingAuth === true,
+        port: portVal
+      };
+    }
+  } catch (_err) {
+    // Fallback if native module does not expose getSessionState
+  }
+  return {
+    connected: isConnectedNative(),
+    connecting: false,
+    awaitingAuth: false,
+    port: 0
+  };
 }
 
 export type ChunkCallback = (chunk: string) => void;
@@ -190,7 +262,29 @@ export function execSyncNative(command: string, bundleName: string = ''): ShellE
  * same broadcast and reports its TCP port.
  */
 export async function discoverNative(): Promise<ShellDiscoveryResult> {
-  return await swshell.discover() as ShellDiscoveryResult;
+  const raw = await swshell.discover() as ShellDiscoveryResult | number | null | undefined;
+  if (typeof raw === 'number') {
+    const validPort = Number.isFinite(raw) && raw > 0 ? raw : 0;
+    return {
+      port: validPort,
+      error: validPort > 0 ? '' : 'discovery failed'
+    };
+  }
+  if (raw && typeof raw === 'object') {
+    const resObj = raw as ShellDiscoveryResult;
+    const validPort = typeof resObj.port === 'number' && Number.isFinite(resObj.port) && resObj.port > 0
+      ? resObj.port
+      : 0;
+    const error = typeof resObj.error === 'string' ? resObj.error : '';
+    return {
+      port: validPort,
+      error: validPort > 0 ? '' : error
+    };
+  }
+  return {
+    port: 0,
+    error: 'invalid discovery response'
+  };
 }
 
 /** The client public key the device remembers, for diagnostics. */

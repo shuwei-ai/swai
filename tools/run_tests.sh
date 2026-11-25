@@ -8,6 +8,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 COMPAT_OUT=${TMPDIR:-/tmp}/swshell-compat-test
 SSH_OUT=${TMPDIR:-/tmp}/swshell-ssh-protocol-test
 DSH_OUT=${TMPDIR:-/tmp}/swshell-dsh-bridge-test
+DISCOVERY_OUT=${TMPDIR:-/tmp}/swshell-discovery-test
 
 clang++ -std=c++17 -Wall -Wextra \
     -I "$ROOT/entry/src/main/cpp/compat" \
@@ -26,8 +27,15 @@ clang++ -std=c++17 -Wall -Wextra -pthread \
     "$ROOT/entry/src/main/cpp/test/dsh_bridge_test.cpp" \
     -o "$DSH_OUT"
 
+clang++ -std=c++17 -Wall -Wextra -Werror \
+    -I "$ROOT/entry/src/main/cpp" \
+    "$ROOT/entry/src/main/cpp/discovery.cpp" \
+    "$ROOT/entry/src/main/cpp/test/discovery_test.cpp" \
+    -o "$DISCOVERY_OUT"
+
 RC=0
 "$SSH_OUT" || RC=$?
 "$COMPAT_OUT" || RC=$?
 "$DSH_OUT" || RC=$?
+"$DISCOVERY_OUT" || RC=$?
 exit $RC

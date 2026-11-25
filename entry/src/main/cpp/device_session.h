@@ -34,6 +34,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -52,9 +54,23 @@ struct ExecResult {
     std::string error;
 };
 
+struct ConnectResult {
+    bool ok = false;
+    int port = 0;
+    std::string reason;
+    std::string error;
+};
+
+struct SessionStateSnapshot {
+    bool connected = false;
+    bool connecting = false;
+    bool awaitingAuth = false;
+    int port = 0;
+};
+
 class DeviceSession : public Hdc::HdcSessionBase {
 public:
-    using ConnectCallback = std::function<void(bool ok, const std::string &error)>;
+    using ConnectCallback = std::function<void(const ConnectResult &result)>;
     using StreamChunkCallback = std::function<void(const std::string &chunk)>;
 
     DeviceSession();
@@ -72,9 +88,13 @@ public:
      */
     void ConnectAsync(const std::string &host, int port, const std::string &keyDir, ConnectCallback callback);
 
+    void CancelPendingConnect();
+
     void Disconnect();
 
     bool IsReady() const;
+
+    SessionStateSnapshot GetSessionState() const;
 
     /*
      * Runs one command on the device and waits for it to finish.
@@ -92,19 +112,25 @@ public:
      */
     bool Abort();
 
-    /* Called from the session worker thread. */
+    /* Called from the session worker thread / main loop. */
     bool FetchCommand(Hdc::HSession hSession, const uint32_t channelId, const uint16_t command,
                       uint8_t *payload, int payloadSize) override;
+
+    void NotifyInstanceSessionFree(Hdc::HSession hSession, bool freeOrClear) override;
 
     /* Diagnostics for the UI. */
     std::function<void(const std::string &)> logSink;
     std::function<void(bool ready, const std::string &detail)> stateSink;
 
 private:
+    static void OnWakeAsync(uv_async_t *handle);
+    bool PostToLoop(std::function<void()> fn);
+    void DrainPostQueue();
     void StartLoop();
     void StopLoop();
-    void FinishConnect(bool ok, const std::string &error);
+    void FinishConnect(const ConnectResult &result);
     void TryNextCandidate();
+    void OnProbeTimeout(uint64_t expectedGen, uint32_t timedOutSid, int attemptPort);
     bool HandleHandshake(Hdc::HSession hSession, const uint32_t channelId, uint8_t *payload, int payloadSize);
     bool SendHandshake(Hdc::HSession hSession, const uint32_t channelId, uint8_t authType, const std::string &buf);
     void Report(const std::string &message);
@@ -113,20 +139,33 @@ private:
 
     std::thread loopThread_;
     std::atomic<bool> loopRunning_{false};
+    uv_async_t wakeAsync_{};
+    bool wakeAsyncInit_ = false;
+    std::mutex postMutex_;
+    std::deque<std::function<void()>> postQueue_;
 
     Hdc::HdcHostTCP *tcpClient_ = nullptr;
     Hdc::HSession session_ = nullptr;
     uint32_t nextChannelId_ = 1;
 
+    std::string host_ = "127.0.0.1";
     std::string connectKey_;
     std::string keyDir_;
     std::vector<int> candidates_;
     size_t candidateIndex_ = 0;
+    bool singleExplicitPort_ = false;
+    std::string lastCandidateError_;
+    std::string lastCandidateReason_;
 
     mutable std::mutex mutex_;
     mutable std::condition_variable readyCv_;
     bool handshakeOk_ = false;
-    std::string handshakeError_;
+    bool connecting_ = false;
+    bool awaitingAuth_ = false;
+    int connectedPort_ = 0;
+    int attemptPort_ = 0;
+    uint64_t attemptGen_ = 0;
+    uint32_t currentAttemptSessionId_ = 0;
     ConnectCallback connectCallback_;
 
     mutable std::mutex execSerializeMutex_;
@@ -135,6 +174,7 @@ private:
     uint32_t pendingChannelId_ = 0;
     bool pendingDone_ = false;
     bool pendingAborted_ = false;
+    bool pendingDisconnected_ = false;
     std::string pendingOutput_;
     StreamChunkCallback streamChunkSink_;
 };

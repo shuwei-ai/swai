@@ -23,10 +23,51 @@
 #ifndef SW_SHELL_DISCOVERY_H
 #define SW_SHELL_DISCOVERY_H
 
+#include <cstddef>
+#include <istream>
 #include <string>
 #include <vector>
 
 namespace swshell {
+
+/**
+ * Parses "<banner>-<port>" from a UDP discovery reply and returns the TCP port,
+ * or 0 when the datagram is invalid or is our own broadcast echo.
+ */
+int ParseDaemonPort(const char *data, size_t length);
+
+/**
+ * Parses listening TCP ports (state "0A", wildcard or loopback address) from
+ * a `/proc/net/tcp` or `/proc/net/tcp6` formatted stream.
+ */
+void CollectPortsFromProcStream(std::istream &stream, std::vector<int> &ports);
+
+/**
+ * Parses listening TCP ports and splits them into `uid == 2000` (shell/hdcd)
+ * ports vs other listening ports so `hdcd` is always probed first.
+ */
+void CollectPrioritizedPortsFromProcStream(std::istream &stream,
+                                           std::vector<int> &shellPorts,
+                                           std::vector<int> &otherPorts);
+
+/**
+ * Filters invalid and excluded ports (such as the app's own local servers)
+ * and returns a sorted, deduplicated candidate port list.
+ */
+std::vector<int> FilterCandidatePorts(const std::vector<int> &ports, const std::vector<int> &excludePorts);
+
+/**
+ * Returns listening TCP ports with `uid == 2000` (shell/hdcd) sockets placed
+ * first, excluding `excludePorts`.  Falls back to a fast non-blocking loopback
+ * TCP scan when `/proc/net/tcp` is unreadable inside the HarmonyOS app sandbox.
+ */
+std::vector<int> ListPrioritizedListeningPorts(const std::vector<int> &excludePorts);
+
+/**
+ * Fast non-blocking loopback (`127.0.0.1`) TCP port scanner for `[startPort, endPort]`.
+ * Works inside sandboxed HarmonyOS apps where `/proc/net/tcp` is denied by SELinux.
+ */
+std::vector<int> ScanLoopbackPorts(int startPort, int endPort, const std::vector<int> &excludePorts);
 
 /**
  * Broadcasts the discovery datagram and waits for the daemon's answer.
