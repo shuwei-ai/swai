@@ -108,7 +108,7 @@ export class DshToolBridge {
 
     let result: ToolResult;
     try {
-      result = await ToolRegistry.execute(toolCall);
+      result = await ToolRegistry.executeRaw(toolCall);
     } catch (err) {
       result = {
         toolCallId: reqId,

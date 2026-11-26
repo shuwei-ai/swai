@@ -639,20 +639,44 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "    child.stderr = stderr;\n"
                 "    child.stdin = stdin;\n"
                 "    child.stdio = [stdin, stdout, stderr];\n"
+                "    const reqId = `dsh-cp-${Date.now()}-${pid}`;\n"
+                "    const reqTimeoutMs = (options && typeof options.timeout === 'number' && Number.isFinite(options.timeout) && options.timeout > 0)\n"
+                "      ? Math.min(Math.max(Math.round(options.timeout), 1000), 305000)\n"
+                "      : 60000;\n"
+                "    const cmdTimeoutSec = Math.max(1, Math.min(300, Math.ceil(reqTimeoutMs / 1000)));\n"
+                "    const httpTimeoutMs = reqTimeoutMs + 5000;\n"
                 "    let req = null;\n"
+                "    function sendSpawnCancel() {\n"
+                "      try {\n"
+                "        const cBody = JSON.stringify({ requestId: reqId });\n"
+                "        const cReq = http.request({\n"
+                "          hostname: '127.0.0.1',\n"
+                "          port: 38081,\n"
+                "          path: '/v1/tool/cancel',\n"
+                "          method: 'POST',\n"
+                "          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(cBody) },\n"
+                "          timeout: 1500\n"
+                "        }, (cres) => { cres.resume(); });\n"
+                "        cReq.on('error', () => {});\n"
+                "        cReq.on('timeout', () => { cReq.destroy(); });\n"
+                "        cReq.write(cBody);\n"
+                "        cReq.end();\n"
+                "      } catch (e) {}\n"
+                "    }\n"
                 "    child.kill = function(sig) {\n"
                 "      child.killed = true;\n"
                 "      child.signalCode = sig || 'SIGTERM';\n"
+                "      sendSpawnCancel();\n"
                 "      if (req && !req.destroyed) { try { req.destroy(); } catch(e){} }\n"
                 "      return true;\n"
                 "    };\n"
                 "    process.nextTick(() => {\n"
                 "      child.emit('spawn');\n"
                 "      const reqData = JSON.stringify({\n"
-                "        requestId: `dsh-cp-${Date.now()}-${pid}`,\n"
+                "        requestId: reqId,\n"
                 "        tool: 'bash',\n"
-                "        args: { command: effectiveCmd },\n"
-                "        deadlineMs: Date.now() + 60000\n"
+                "        args: { command: effectiveCmd, timeout_seconds: cmdTimeoutSec },\n"
+                "        deadlineMs: Date.now() + httpTimeoutMs\n"
                 "      });\n"
                 "      req = http.request({\n"
                 "        hostname: '127.0.0.1',\n"
@@ -663,7 +687,7 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "          'Content-Type': 'application/json',\n"
                 "          'Content-Length': Buffer.byteLength(reqData)\n"
                 "        },\n"
-                "        timeout: 60000\n"
+                "        timeout: httpTimeoutMs\n"
                 "      }, (res) => {\n"
                 "        let body = '';\n"
                 "        res.on('data', chunk => { body += chunk; });\n"
@@ -744,21 +768,119 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "  const http = require('http');\n"
                 "  const { URL } = require('url');\n"
                 "  function createFetchPolyfill() {\n"
+                "    const httpsAgent = new https.Agent({\n"
+                "      keepAlive: true,\n"
+                "      keepAliveMsecs: 15000,\n"
+                "      timeout: 55000,\n"
+                "      maxSockets: 32,\n"
+                "      maxFreeSockets: 8,\n"
+                "      maxCachedSessions: 0,\n"
+                "      rejectUnauthorized: false\n"
+                "    });\n"
+                "    const httpAgent = new http.Agent({\n"
+                "      keepAlive: true,\n"
+                "      keepAliveMsecs: 15000,\n"
+                "      timeout: 55000,\n"
+                "      maxSockets: 32,\n"
+                "      maxFreeSockets: 8\n"
+                "    });\n"
+                "    const MAX_RETRIES = 2;\n"
+                "    const RETRYABLE_CODES = new Set([\n"
+                "      'ERR_SSL_CIPHER_OPERATION_FAILED',\n"
+                "      'EPROTO',\n"
+                "      'ECONNRESET',\n"
+                "      'ECONNABORTED',\n"
+                "      'EPIPE',\n"
+                "      'ERR_SSL_WRONG_VERSION_NUMBER',\n"
+                "      'ERR_SOCKET_CONNECTION_TIMEOUT'\n"
+                "    ]);\n"
+                "    const RETRYABLE_RE = /ossl_gcm_stream_update|cipher operation failed|wrong version number|header too long|socket hang up|disconnected before secure TLS|ECONNRESET|ECONNABORTED|EPROTO/i;\n"
+                "    function isRetryableNetError(err, signal) {\n"
+                "      if (!err || err.name === 'AbortError' || (signal && signal.aborted)) return false;\n"
+                "      if (err.code && RETRYABLE_CODES.has(err.code)) return true;\n"
+                "      const msg = String(err.message || err);\n"
+                "      if (msg === 'aborted') return true;\n"
+                "      return RETRYABLE_RE.test(msg);\n"
+                "    }\n"
+                "    function evictHostFreeSockets(agent, hostname) {\n"
+                "      const freeMap = agent && agent.freeSockets;\n"
+                "      if (!freeMap) return;\n"
+                "      for (const key of Object.keys(freeMap)) {\n"
+                "        if (!hostname || key === hostname || key.startsWith(hostname + ':')) {\n"
+                "          const list = freeMap[key];\n"
+                "          if (Array.isArray(list)) {\n"
+                "            for (const sock of list.slice()) {\n"
+                "              try { sock.destroy(); } catch (_e) {}\n"
+                "            }\n"
+                "          }\n"
+                "        }\n"
+                "      }\n"
+                "    }\n"
+                "    function normalizeBody(bodyData) {\n"
+                "      if (bodyData === undefined || bodyData === null) {\n"
+                "        return { bodyBuf: null, isStreamBody: false };\n"
+                "      }\n"
+                "      if (typeof bodyData.pipe === 'function') {\n"
+                "        return { bodyBuf: null, isStreamBody: true };\n"
+                "      }\n"
+                "      if (Buffer.isBuffer(bodyData)) {\n"
+                "        return { bodyBuf: bodyData, isStreamBody: false };\n"
+                "      }\n"
+                "      if (typeof bodyData === 'string') {\n"
+                "        return { bodyBuf: Buffer.from(bodyData, 'utf8'), isStreamBody: false };\n"
+                "      }\n"
+                "      if (ArrayBuffer.isView(bodyData)) {\n"
+                "        return { bodyBuf: Buffer.from(bodyData.buffer, bodyData.byteOffset, bodyData.byteLength), isStreamBody: false };\n"
+                "      }\n"
+                "      if (bodyData instanceof ArrayBuffer) {\n"
+                "        return { bodyBuf: Buffer.from(bodyData), isStreamBody: false };\n"
+                "      }\n"
+                "      return { bodyBuf: null, isStreamBody: false };\n"
+                "    }\n"
                 "    return function customFetch(input, init = {}) {\n"
                 "      return new Promise((resolve, reject) => {\n"
+                "        const signal = init.signal || (input && input.signal);\n"
+                "        if (signal && signal.aborted) {\n"
+                "          const err = new Error('This operation was aborted');\n"
+                "          err.name = 'AbortError';\n"
+                "          return reject(err);\n"
+                "        }\n"
+                "        let settled = false;\n"
+                "        let retryTimer = null;\n"
+                "        let activeReq = null;\n"
+                "        let abortHandler = null;\n"
+                "        function cleanup() {\n"
+                "          if (retryTimer) {\n"
+                "            clearTimeout(retryTimer);\n"
+                "            retryTimer = null;\n"
+                "          }\n"
+                "          if (signal && abortHandler) {\n"
+                "            try { signal.removeEventListener('abort', abortHandler); } catch (_e) {}\n"
+                "            abortHandler = null;\n"
+                "          }\n"
+                "        }\n"
+                "        if (signal) {\n"
+                "          abortHandler = () => {\n"
+                "            if (settled) return;\n"
+                "            settled = true;\n"
+                "            cleanup();\n"
+                "            if (activeReq) {\n"
+                "              try { activeReq.destroy(); } catch (_e) {}\n"
+                "            }\n"
+                "            const err = new Error('This operation was aborted');\n"
+                "            err.name = 'AbortError';\n"
+                "            reject(err);\n"
+                "          };\n"
+                "          signal.addEventListener('abort', abortHandler, { once: true });\n"
+                "        }\n"
                 "        try {\n"
                 "          const inputUrl = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));\n"
                 "          writeLog('FETCH', 'fetch called: ' + inputUrl);\n"
                 "          const parsedUrl = new URL(inputUrl);\n"
                 "          const isHttps = parsedUrl.protocol === 'https:';\n"
                 "          const client = isHttps ? https : http;\n"
+                "          const agent = isHttps ? httpsAgent : httpAgent;\n"
                 "          const method = (init.method || (input && input.method) || 'GET').toUpperCase();\n"
-                "          const signal = init.signal || (input && input.signal);\n"
-                "          if (signal && signal.aborted) {\n"
-                "            const err = new Error('This operation was aborted');\n"
-                "            err.name = 'AbortError';\n"
-                "            return reject(err);\n"
-                "          }\n"
                 "          const outHeaders = {};\n"
                 "          const inHeaders = init.headers || (input && input.headers);\n"
                 "          if (inHeaders) {\n"
@@ -770,108 +892,150 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "              Object.assign(outHeaders, inHeaders);\n"
                 "            }\n"
                 "          }\n"
-                "          const reqOptions = {\n"
-                "            protocol: parsedUrl.protocol,\n"
-                "            hostname: parsedUrl.hostname,\n"
-                "            port: parsedUrl.port || (isHttps ? 443 : 80),\n"
-                "            path: parsedUrl.pathname + parsedUrl.search,\n"
-                "            method,\n"
-                "            headers: outHeaders,\n"
-                "            rejectUnauthorized: false\n"
-                "          };\n"
-                "          const req = client.request(reqOptions, (res) => {\n"
-                "            const redirectMode = init.redirect || 'follow';\n"
-                "            if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {\n"
-                "              if (redirectMode === 'error') {\n"
-                "                const err = new Error('Redirect blocked: ' + res.statusCode + ' to ' + res.headers.location);\n"
-                "                return reject(err);\n"
-                "              } else if (redirectMode === 'follow') {\n"
-                "                const nextUrl = new URL(res.headers.location, parsedUrl).toString();\n"
-                "                const nextInit = { ...init };\n"
-                "                if (res.statusCode === 303 || ((res.statusCode === 301 || res.statusCode === 302) && method === 'POST')) {\n"
-                "                  nextInit.method = 'GET';\n"
-                "                  delete nextInit.body;\n"
+                "          const rawBody = init.body !== undefined ? init.body : (input && input.body);\n"
+                "          const { bodyBuf, isStreamBody } = normalizeBody(rawBody);\n"
+                "          if (bodyBuf !== null) {\n"
+                "            let hasLenOrTE = false;\n"
+                "            for (const hk of Object.keys(outHeaders)) {\n"
+                "              const low = hk.toLowerCase();\n"
+                "              if (low === 'content-length' || low === 'transfer-encoding') {\n"
+                "                hasLenOrTE = true;\n"
+                "                break;\n"
+                "              }\n"
+                "            }\n"
+                "            if (!hasLenOrTE) {\n"
+                "              outHeaders['Content-Length'] = String(bodyBuf.length);\n"
+                "            }\n"
+                "          }\n"
+                "          function runAttempt(attempt) {\n"
+                "            if (settled) return;\n"
+                "            let attemptDone = false;\n"
+                "            let req = null;\n"
+                "            function failAttempt(logTag, err) {\n"
+                "              if (attemptDone || settled) return;\n"
+                "              attemptDone = true;\n"
+                "              writeLog(logTag, (err && err.message) ? err.message : String(err));\n"
+                "              if (req) {\n"
+                "                try { if (req.socket) req.socket.destroy(); } catch (_e) {}\n"
+                "                try { req.destroy(); } catch (_e) {}\n"
+                "              }\n"
+                "              if (!isStreamBody && attempt < MAX_RETRIES && isRetryableNetError(err, signal)) {\n"
+                "                evictHostFreeSockets(agent, parsedUrl.hostname);\n"
+                "                const reason = (err && (err.code || err.message)) || 'unknown';\n"
+                "                writeLog('FETCH_RETRY', `attempt=${attempt + 1}/${MAX_RETRIES} url=${inputUrl} reason=${reason}`);\n"
+                "                retryTimer = setTimeout(() => {\n"
+                "                  retryTimer = null;\n"
+                "                  if (settled || (signal && signal.aborted)) return;\n"
+                "                  runAttempt(attempt + 1);\n"
+                "                }, 250 * (attempt + 1));\n"
+                "                return;\n"
+                "              }\n"
+                "              settled = true;\n"
+                "              cleanup();\n"
+                "              reject(err);\n"
+                "            }\n"
+                "            try {\n"
+                "              const reqOptions = {\n"
+                "                protocol: parsedUrl.protocol,\n"
+                "                hostname: parsedUrl.hostname,\n"
+                "                port: parsedUrl.port || (isHttps ? 443 : 80),\n"
+                "                path: parsedUrl.pathname + parsedUrl.search,\n"
+                "                method,\n"
+                "                headers: outHeaders,\n"
+                "                agent,\n"
+                "                rejectUnauthorized: false\n"
+                "              };\n"
+                "              req = client.request(reqOptions, (res) => {\n"
+                "                const redirectMode = init.redirect || 'follow';\n"
+                "                if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && (redirectMode === 'error' || redirectMode === 'follow')) {\n"
+                "                  res.resume();\n"
+                "                  if (attemptDone || settled) return;\n"
+                "                  attemptDone = true;\n"
+                "                  settled = true;\n"
+                "                  cleanup();\n"
+                "                  if (redirectMode === 'error') {\n"
+                "                    return reject(new Error('Redirect blocked: ' + res.statusCode + ' to ' + res.headers.location));\n"
+                "                  }\n"
+                "                  const nextUrl = new URL(res.headers.location, parsedUrl).toString();\n"
+                "                  const nextInit = { ...init };\n"
+                "                  if (res.statusCode === 303 || ((res.statusCode === 301 || res.statusCode === 302) && method === 'POST')) {\n"
+                "                    nextInit.method = 'GET';\n"
+                "                    delete nextInit.body;\n"
+                "                  }\n"
+                "                  return resolve(customFetch(nextUrl, nextInit));\n"
                 "                }\n"
-                "                return resolve(customFetch(nextUrl, nextInit));\n"
-                "              }\n"
-                "            }\n"
-                "            const resHeaders = (typeof Headers !== 'undefined') ? new Headers() : new Map();\n"
-                "            for (const [key, val] of Object.entries(res.headers)) {\n"
-                "              if (Array.isArray(val)) {\n"
-                "                val.forEach(v => {\n"
-                "                  if (resHeaders.append) resHeaders.append(key, v);\n"
-                "                  else resHeaders.set(key, v);\n"
+                "                const resHeaders = (typeof Headers !== 'undefined') ? new Headers() : new Map();\n"
+                "                for (const [key, val] of Object.entries(res.headers)) {\n"
+                "                  if (Array.isArray(val)) {\n"
+                "                    val.forEach(v => {\n"
+                "                      if (resHeaders.append) resHeaders.append(key, v);\n"
+                "                      else resHeaders.set(key, v);\n"
+                "                    });\n"
+                "                  } else if (val !== undefined) {\n"
+                "                    resHeaders.set(key, val);\n"
+                "                  }\n"
+                "                }\n"
+                "                const chunks = [];\n"
+                "                res.on('data', chunk => chunks.push(chunk));\n"
+                "                res.on('end', () => {\n"
+                "                  if (attemptDone || settled) return;\n"
+                "                  attemptDone = true;\n"
+                "                  settled = true;\n"
+                "                  cleanup();\n"
+                "                  const bodyBuffer = Buffer.concat(chunks);\n"
+                "                  const status = res.statusCode || 200;\n"
+                "                  const statusText = res.statusMessage || '';\n"
+                "                  const ok = status >= 200 && status < 300;\n"
+                "                  let respObj;\n"
+                "                  if (typeof Response !== 'undefined') {\n"
+                "                    try {\n"
+                "                      respObj = new Response(bodyBuffer, {\n"
+                "                        status,\n"
+                "                        statusText,\n"
+                "                        headers: resHeaders\n"
+                "                      });\n"
+                "                    } catch (_e) {}\n"
+                "                  }\n"
+                "                  if (!respObj) {\n"
+                "                    respObj = {\n"
+                "                      status,\n"
+                "                      statusText,\n"
+                "                      ok,\n"
+                "                      headers: resHeaders,\n"
+                "                      url: parsedUrl.toString(),\n"
+                "                      text: async () => bodyBuffer.toString('utf8'),\n"
+                "                      json: async () => JSON.parse(bodyBuffer.toString('utf8')),\n"
+                "                      arrayBuffer: async () => bodyBuffer.buffer.slice(bodyBuffer.byteOffset, bodyBuffer.byteOffset + bodyBuffer.byteLength),\n"
+                "                      body: { cancel: async () => {} }\n"
+                "                    };\n"
+                "                  }\n"
+                "                  writeLog('FETCH_RES', 'status=' + status + ' len=' + bodyBuffer.length);\n"
+                "                  resolve(respObj);\n"
                 "                });\n"
-                "              } else if (val !== undefined) {\n"
-                "                resHeaders.set(key, val);\n"
+                "                res.on('error', err => failAttempt('FETCH_RES_ERR', err));\n"
+                "              });\n"
+                "              activeReq = req;\n"
+                "              req.on('error', err => failAttempt('FETCH_REQ_ERR', err));\n"
+                "              if (bodyBuf !== null) {\n"
+                "                req.write(bodyBuf);\n"
+                "                req.end();\n"
+                "              } else if (isStreamBody) {\n"
+                "                rawBody.pipe(req);\n"
+                "              } else {\n"
+                "                req.end();\n"
                 "              }\n"
-                "            }\n"
-                "            const chunks = [];\n"
-                "            res.on('data', chunk => chunks.push(chunk));\n"
-                "            res.on('end', () => {\n"
-                "              const bodyBuffer = Buffer.concat(chunks);\n"
-                "              const status = res.statusCode || 200;\n"
-                "              const statusText = res.statusMessage || '';\n"
-                "              const ok = status >= 200 && status < 300;\n"
-                "              let respObj;\n"
-                "              if (typeof Response !== 'undefined') {\n"
-                "                try {\n"
-                "                  respObj = new Response(bodyBuffer, {\n"
-                "                    status,\n"
-                "                    statusText,\n"
-                "                    headers: resHeaders\n"
-                "                  });\n"
-                "                } catch (_e) {}\n"
-                "              }\n"
-                "              if (!respObj) {\n"
-                "                respObj = {\n"
-                "                  status,\n"
-                "                  statusText,\n"
-                "                  ok,\n"
-                "                  headers: resHeaders,\n"
-                "                  url: parsedUrl.toString(),\n"
-                "                  text: async () => bodyBuffer.toString('utf8'),\n"
-                "                  json: async () => JSON.parse(bodyBuffer.toString('utf8')),\n"
-                "                  arrayBuffer: async () => bodyBuffer.buffer.slice(bodyBuffer.byteOffset, bodyBuffer.byteOffset + bodyBuffer.byteLength),\n"
-                "                  body: { cancel: async () => {} }\n"
-                "                };\n"
-                "              }\n"
-                "              writeLog('FETCH_RES', 'status=' + status + ' len=' + bodyBuffer.length);\n"
-                "              resolve(respObj);\n"
-                "            });\n"
-                "            res.on('error', err => {\n"
-                "              writeLog('FETCH_RES_ERR', err.message);\n"
-                "              reject(err);\n"
-                "            });\n"
-                "          });\n"
-                "          req.on('error', err => {\n"
-                "            writeLog('FETCH_REQ_ERR', err.message);\n"
-                "            reject(err);\n"
-                "          });\n"
-                "          if (signal) {\n"
-                "            const onAbort = () => {\n"
-                "              req.destroy();\n"
-                "              const err = new Error('This operation was aborted');\n"
-                "              err.name = 'AbortError';\n"
-                "              reject(err);\n"
-                "            };\n"
-                "            signal.addEventListener('abort', onAbort, { once: true });\n"
-                "          }\n"
-                "          const bodyData = init.body || (input && input.body);\n"
-                "          if (bodyData) {\n"
-                "            if (typeof bodyData === 'string' || Buffer.isBuffer(bodyData)) {\n"
-                "              req.write(bodyData);\n"
-                "            } else if (bodyData instanceof Uint8Array) {\n"
-                "              req.write(Buffer.from(bodyData));\n"
-                "            } else if (typeof bodyData.pipe === 'function') {\n"
-                "              bodyData.pipe(req);\n"
-                "              return;\n"
+                "            } catch (err) {\n"
+                "              failAttempt('FETCH_EX', err);\n"
                 "            }\n"
                 "          }\n"
-                "          req.end();\n"
+                "          runAttempt(0);\n"
                 "        } catch (err) {\n"
-                "          writeLog('FETCH_EX', err.message);\n"
-                "          reject(err);\n"
+                "          if (!settled) {\n"
+                "            settled = true;\n"
+                "            cleanup();\n"
+                "            writeLog('FETCH_EX', err.message);\n"
+                "            reject(err);\n"
+                "          }\n"
                 "        }\n"
                 "      });\n"
                 "    };\n"
@@ -1152,6 +1316,211 @@ void DshHost::StopToolBridgeServer() {
     }
 }
 
+static void SkipJsonWs(const std::string& s, size_t& i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) {
+        ++i;
+    }
+}
+
+static bool ParseJsonString(const std::string& s, size_t& i, std::string& out) {
+    if (i >= s.size() || s[i] != '"') {
+        return false;
+    }
+    ++i;
+    out.clear();
+    while (i < s.size()) {
+        char c = s[i++];
+        if (c == '"') {
+            return true;
+        }
+        if (c == '\\') {
+            if (i >= s.size()) {
+                return false;
+            }
+            char esc = s[i++];
+            switch (esc) {
+                case '"': out.push_back('"'); break;
+                case '\\': out.push_back('\\'); break;
+                case '/': out.push_back('/'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                case 'n': out.push_back('\n'); break;
+                case 'r': out.push_back('\r'); break;
+                case 't': out.push_back('\t'); break;
+                case 'u': {
+                    if (i + 4 > s.size()) {
+                        return false;
+                    }
+                    uint32_t cp = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        char h = s[i++];
+                        cp <<= 4;
+                        if (h >= '0' && h <= '9') cp |= static_cast<uint32_t>(h - '0');
+                        else if (h >= 'a' && h <= 'f') cp |= static_cast<uint32_t>(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') cp |= static_cast<uint32_t>(h - 'A' + 10);
+                        else return false;
+                    }
+                    if (cp < 0x80) {
+                        out.push_back(static_cast<char>(cp));
+                    } else if (cp < 0x800) {
+                        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                    } else {
+                        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                    }
+                    break;
+                }
+                default:
+                    out.push_back(esc);
+                    break;
+            }
+        } else {
+            out.push_back(c);
+        }
+    }
+    return false;
+}
+
+static bool SkipJsonValue(const std::string& s, size_t& i) {
+    SkipJsonWs(s, i);
+    if (i >= s.size()) {
+        return false;
+    }
+    char c = s[i];
+    if (c == '"') {
+        std::string tmp;
+        return ParseJsonString(s, i, tmp);
+    }
+    if (c == '{' || c == '[') {
+        int depth = 1;
+        bool in_str = false;
+        bool esc = false;
+        ++i;
+        while (i < s.size() && depth > 0) {
+            char ch = s[i++];
+            if (in_str) {
+                if (esc) {
+                    esc = false;
+                } else if (ch == '\\') {
+                    esc = true;
+                } else if (ch == '"') {
+                    in_str = false;
+                }
+            } else {
+                if (ch == '"') {
+                    in_str = true;
+                } else if (ch == '{' || ch == '[') {
+                    ++depth;
+                } else if (ch == '}' || ch == ']') {
+                    --depth;
+                }
+            }
+        }
+        return depth == 0;
+    }
+    size_t start = i;
+    while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']' &&
+           s[i] != ' ' && s[i] != '\t' && s[i] != '\r' && s[i] != '\n') {
+        ++i;
+    }
+    return i > start;
+}
+
+bool ParseToolHttpBodyJson(const std::string& body, ParsedToolHttpBody& out) {
+    out = ParsedToolHttpBody{};
+    size_t i = 0;
+    SkipJsonWs(body, i);
+    if (i >= body.size() || body[i] != '{') {
+        return false;
+    }
+    ++i;
+    SkipJsonWs(body, i);
+    if (i < body.size() && body[i] == '}') {
+        return true;
+    }
+    while (i < body.size()) {
+        SkipJsonWs(body, i);
+        std::string key;
+        if (!ParseJsonString(body, i, key)) {
+            return false;
+        }
+        SkipJsonWs(body, i);
+        if (i >= body.size() || body[i] != ':') {
+            return false;
+        }
+        ++i;
+        SkipJsonWs(body, i);
+        if (i >= body.size()) {
+            return false;
+        }
+
+        if (key == "requestId" && body[i] == '"') {
+            if (!ParseJsonString(body, i, out.request_id)) {
+                return false;
+            }
+        } else if (key == "tool" && body[i] == '"') {
+            if (!ParseJsonString(body, i, out.tool)) {
+                return false;
+            }
+        } else if (key == "args" && body[i] == '{') {
+            size_t start = i;
+            if (!SkipJsonValue(body, i)) {
+                return false;
+            }
+            out.args_json = body.substr(start, i - start);
+        } else if (key == "deadlineMs" && (isdigit(static_cast<unsigned char>(body[i])) || body[i] == '-')) {
+            size_t start = i;
+            if (body[i] == '-') {
+                ++i;
+            }
+            while (i < body.size() && isdigit(static_cast<unsigned char>(body[i]))) {
+                ++i;
+            }
+            if (i > start) {
+                try {
+                    out.deadline_ms = std::stoll(body.substr(start, i - start));
+                } catch (...) {
+                    out.deadline_ms = 0;
+                }
+            }
+        } else {
+            if (!SkipJsonValue(body, i)) {
+                return false;
+            }
+        }
+
+        SkipJsonWs(body, i);
+        if (i >= body.size()) {
+            return false;
+        }
+        if (body[i] == ',') {
+            ++i;
+            continue;
+        }
+        if (body[i] == '}') {
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+int ComputePollTimeoutMs(int64_t deadline_ms, int64_t now_epoch_ms) {
+    if (deadline_ms <= 0) {
+        return 60000;
+    }
+    int64_t diff = deadline_ms - now_epoch_ms;
+    if (diff < 1000) {
+        return 1000;
+    }
+    if (diff > 310000) {
+        return 310000;
+    }
+    return static_cast<int>(diff);
+}
+
 void DshHost::HandleToolHttpRequest(int cfd) {
     std::string req_data;
     char buf[2048];
@@ -1162,6 +1531,19 @@ void DshHost::HandleToolHttpRequest(int cfd) {
         n = recv(cfd, buf, sizeof(buf), 0);
         if (n <= 0) return;
         req_data.append(buf, n);
+    }
+
+    std::string req_path = "/v1/tool/execute";
+    size_t line_end = req_data.find("\r\n");
+    if (line_end != std::string::npos) {
+        std::string first_line = req_data.substr(0, line_end);
+        size_t sp1 = first_line.find(' ');
+        if (sp1 != std::string::npos) {
+            size_t sp2 = first_line.find(' ', sp1 + 1);
+            if (sp2 != std::string::npos && sp2 > sp1 + 1) {
+                req_path = first_line.substr(sp1 + 1, sp2 - sp1 - 1);
+            }
+        }
     }
 
     size_t content_length = 0;
@@ -1181,109 +1563,65 @@ void DshHost::HandleToolHttpRequest(int cfd) {
         req_data.append(buf, n);
     }
 
-    std::string body = req_data.substr(body_start);
-    OH_LOG_Print(LOG_APP, LOG_DEBUG, 0x3201, "DSHHost", "Tool HTTP Request: %{public}s", body.c_str());
+    std::string body = (content_length > 0 && req_data.size() >= body_start + content_length)
+        ? req_data.substr(body_start, content_length)
+        : req_data.substr(body_start);
+    OH_LOG_Print(LOG_APP, LOG_DEBUG, 0x3201, "DSHHost", "Tool HTTP Request (%{public}s): %{public}s", req_path.c_str(), body.c_str());
 
-    std::string req_id;
-    std::string tool = "bash";
-    std::string args_json = "{}";
-    int64_t deadline_ms = 0;
+    ParsedToolHttpBody parsed;
+    ParseToolHttpBodyJson(body, parsed);
 
-    size_t r_pos = body.find("\"requestId\":");
-    if (r_pos != std::string::npos) {
-        size_t q1 = body.find('"', r_pos + 12);
-        if (q1 != std::string::npos) {
-            size_t q2 = body.find('"', q1 + 1);
-            if (q2 != std::string::npos) {
-                req_id = body.substr(q1 + 1, q2 - q1 - 1);
-            }
+    if (req_path == "/v1/tool/cancel") {
+        bool cancelled = false;
+        if (!parsed.request_id.empty()) {
+            cancelled = swshell::DshState::GetInstance().CancelToolFromNode(parsed.request_id);
         }
-    }
-    if (req_id.empty()) {
-        req_id = "req-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-    }
-
-    size_t t_pos = body.find("\"tool\":");
-    if (t_pos != std::string::npos) {
-        size_t q1 = body.find('"', t_pos + 7);
-        if (q1 != std::string::npos) {
-            size_t q2 = body.find('"', q1 + 1);
-            if (q2 != std::string::npos) {
-                tool = body.substr(q1 + 1, q2 - q1 - 1);
-            }
-        }
+        std::string resp_json = std::string("{\"ok\":true,\"cancelled\":") + (cancelled ? "true" : "false") + "}";
+        std::string http_resp = "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Content-Length: " + std::to_string(resp_json.size()) + "\r\n"
+                                "Connection: close\r\n\r\n" + resp_json;
+        send(cfd, http_resp.data(), http_resp.size(), 0);
+        return;
     }
 
-    size_t a_pos = body.find("\"args\":");
-    if (a_pos != std::string::npos) {
-        size_t b1 = body.find('{', a_pos + 7);
-        if (b1 != std::string::npos) {
-            int depth = 1;
-            bool in_str = false;
-            bool esc = false;
-            size_t b2 = b1 + 1;
-            for (; b2 < body.size() && depth > 0; b2++) {
-                char ch = body[b2];
-                if (in_str) {
-                    if (esc) {
-                        esc = false;
-                    } else if (ch == '\\') {
-                        esc = true;
-                    } else if (ch == '"') {
-                        in_str = false;
-                    }
-                } else {
-                    if (ch == '"') {
-                        in_str = true;
-                    } else if (ch == '{') {
-                        depth++;
-                    } else if (ch == '}') {
-                        depth--;
-                    }
-                }
-            }
-            if (depth == 0) {
-                args_json = body.substr(b1, b2 - b1);
-            }
-        }
-    }
-
-    size_t d_pos = body.find("\"deadlineMs\":");
-    if (d_pos != std::string::npos) {
-        size_t n1 = d_pos + 13;
-        while (n1 < body.size() && (body[n1] == ' ' || body[n1] == ':')) n1++;
-        size_t n2 = n1;
-        while (n2 < body.size() && isdigit(body[n2])) n2++;
-        if (n2 > n1) {
-            deadline_ms = std::stoll(body.substr(n1, n2 - n1));
-        }
-    }
+    std::string req_id = !parsed.request_id.empty()
+        ? parsed.request_id
+        : ("req-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::string tool = !parsed.tool.empty() ? parsed.tool : "bash";
+    std::string args_json = !parsed.args_json.empty() ? parsed.args_json : "{}";
 
     swshell::DshToolRequest treq;
     treq.request_id = req_id;
     treq.tool = tool;
     treq.args_json = args_json;
-    treq.deadline_ms = deadline_ms;
+    treq.deadline_ms = parsed.deadline_ms;
 
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x3201, "DSHHost",
                  "Dispatching tool to ArkTS: req_id=%{public}s tool=%{public}s",
                  req_id.c_str(), tool.c_str());
 
-    swshell::DshState::GetInstance().DispatchToolFromNode(treq);
-
-    swshell::DshToolResponse resp;
-    int res = swshell::DshState::GetInstance().PollToolResultForNode(req_id, resp, 60000);
-
     std::string resp_json;
-    if (res == 1) { // Succeeded/Finished
-        resp_json = "{\"ok\":" + std::string(resp.success ? "true" : "false") +
-                    ",\"output\":\"" + ToolJsonEscape(resp.output) + "\"" +
-                    ",\"error\":\"" + ToolJsonEscape(resp.error) + "\"" +
-                    ",\"exitCode\":" + std::to_string(resp.exit_code) + "}";
-    } else if (res == 2) { // Cancelled
-        resp_json = "{\"ok\":false,\"output\":\"\",\"error\":\"Tool execution cancelled\",\"exitCode\":-1}";
-    } else { // Timeout / pending
-        resp_json = "{\"ok\":false,\"output\":\"\",\"error\":\"Tool execution timed out\",\"exitCode\":-1}";
+    if (!swshell::DshState::GetInstance().DispatchToolFromNode(treq)) {
+        resp_json = "{\"ok\":false,\"output\":\"\",\"error\":\"DSH host is not running\",\"exitCode\":-1}";
+    } else {
+        int64_t now_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        int poll_ms = ComputePollTimeoutMs(treq.deadline_ms, now_epoch_ms);
+
+        swshell::DshToolResponse resp;
+        int res = swshell::DshState::GetInstance().PollToolResultForNode(req_id, resp, poll_ms);
+
+        if (res == 1) { // Succeeded/Finished
+            resp_json = "{\"ok\":" + std::string(resp.success ? "true" : "false") +
+                        ",\"output\":\"" + ToolJsonEscape(resp.output) + "\"" +
+                        ",\"error\":\"" + ToolJsonEscape(resp.error) + "\"" +
+                        ",\"exitCode\":" + std::to_string(resp.exit_code) + "}";
+        } else if (res == 2) { // Cancelled
+            resp_json = "{\"ok\":false,\"output\":\"\",\"error\":\"Tool execution cancelled\",\"exitCode\":-1}";
+        } else { // Timeout / pending
+            resp_json = "{\"ok\":false,\"output\":\"\",\"error\":\"Tool execution timed out\",\"exitCode\":-1}";
+        }
     }
 
     std::string http_resp = "HTTP/1.1 200 OK\r\n"

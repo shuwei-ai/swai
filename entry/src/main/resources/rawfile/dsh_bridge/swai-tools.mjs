@@ -4,23 +4,111 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+import fsp from 'node:fs/promises';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { dispatchSwaiTool } from './bridge-client.mjs';
 
 export const name = 'swai-privileged-tools';
 export const inject = ['tools', 'systemPrompt'];
 
+const TEXT_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    text: { type: 'string', required: true }
+  }
+};
+
+function renderTextOutput(_args, value) {
+  return [{
+    type: 'text',
+    text: typeof value === 'string' ? value : (value?.text || JSON.stringify(value))
+  }];
+}
+
+function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function resolveWritableTempDir() {
+  const candidates = [
+    process.env.TMPDIR,
+    process.env.HOME ? path.join(process.env.HOME, '.tmp') : null,
+    '/data/storage/el2/base/haps/entry/files/workspace/.tmp'
+  ];
+  for (const dir of candidates) {
+    if (dir && dir !== '/tmp') {
+      return dir;
+    }
+  }
+  return '/data/storage/el2/base/haps/entry/files/workspace/.tmp';
+}
+
+function detectImageMediaType(targetPath, data) {
+  const ext = path.extname(targetPath).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+
+  if (data && data.length >= 8 &&
+      data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) {
+    return 'image/png';
+  }
+  if (data && data.length >= 12 &&
+      data.toString('ascii', 0, 4) === 'RIFF' && data.toString('ascii', 8, 12) === 'WEBP') {
+    return 'image/webp';
+  }
+  if (data && data.length >= 6) {
+    const sig = data.toString('ascii', 0, 6);
+    if (sig === 'GIF87a' || sig === 'GIF89a') {
+      return 'image/gif';
+    }
+  }
+  return 'image/jpeg';
+}
+
+const CAPTURE_IMAGE_VALUE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    attachmentId: { type: 'string', required: true },
+    mediaType: {
+      type: 'string',
+      enum: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+      required: true
+    },
+    bytes: { type: 'integer', required: true },
+    width: { type: 'integer', required: true },
+    height: { type: 'integer', required: true },
+    name: { type: 'string' },
+    originalDimensions: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        width: { type: 'integer', required: true },
+        height: { type: 'integer', required: true }
+      }
+    }
+  }
+};
+
 export function apply(ctx) {
-  // Inject system prompt guidance so DSH prioritizes native tools
+  // Inject system prompt guidance so DSH uses mobile-native tools efficiently
   if (ctx.systemPrompt && typeof ctx.systemPrompt.section === 'function') {
     ctx.systemPrompt.section({
       name: 'tool:swai-environment',
       order: 400,
       text: () => [
         '# Mobile Host Capabilities & Web Navigation',
-        '- For viewing, opening, or interacting with webpages (including login pages, search engines, articles), ALWAYS prefer the standard MCP browser tools (`mcp__swai__browser_navigate`, `mcp__swai__browser_snapshot`, `mcp__swai__browser_click`, `mcp__swai__browser_type`, `mcp__swai__browser_evaluate`). This activates the in-app browser overlay and performs resilient CDP automation.',
-        '- Do NOT attempt to launch external browser apps (like com.huawei.hmos.browser) via shell commands or ui launch_app unless explicitly requested by the user.',
-        '- You have direct access to `glob` and `grep` (in-process native filesystem search), `read`/`write`/`edit` for workspace files, `bash` for system shell commands (runs with uid 2000 and automatically bridges `/data/storage/` sandbox paths via debug mount), `ui` for HarmonyOS UI automation (uitest/uinput), `offline_code` for Python/JS offline evaluation, and `remote_bash` for remote server execution via SSH.'
+        '- For viewing, opening, or interacting with webpages (including login pages, search engines, articles), ALWAYS prefer the standard MCP browser tools (`mcp__swai__browser_navigate`, `mcp__swai__browser_snapshot`, `mcp__swai__browser_click`, `mcp__swai__browser_type`, `mcp__swai__browser_evaluate`, `mcp__swai__browser_extract_text`). This activates the in-app ArkWeb overlay and performs resilient CDP automation.',
+        '- For WeChat Official Account formatting and draft publishing, use `mcp__swai__wechat_render_article` and `mcp__swai__wechat_post_draft`.',
+        '- Do NOT attempt to launch external browser apps (like com.huawei.hmos.browser) via shell commands or `ui(action="launch_app")` unless explicitly requested by the user.',
+        '- For HarmonyOS UI automation, use `ui`. Prefer `action="run_sequence"` for deterministic multi-step flows to save turns, `action="click_anchor"` for common navigation icons (`search`, `back`, `more`, `chat_input`, `voice_toggle`, `send`), and `use_ocr=true` or `action="ocr"` for custom/canvas views lacking accessibility labels.',
+        '- For inspecting the current device screen, call `capture_screen` (hardware capture via `snapshot_display`/`uitest screenCap`). Vision-capable models receive the image inline; text-only models receive the saved file path and can follow up with `ui(action="ocr")` or `ui(action="dump_tree")`.',
+        '- You have direct access to `glob` and `grep` (in-process native filesystem search), `read`/`write`/`edit` for workspace files, `bash` for HarmonyOS system commands (runs with `uid=2000` and automatically bridges `/data/storage/` sandbox paths via debug mount), `offline_code` for Python 3.13 / JS V8 execution (supports `code` or workspace `path`, `import hdc`, `import pip`, and `PIL`), and `remote_bash` for remote server execution via SSH.'
       ].join('\n')
     });
   }
@@ -28,25 +116,65 @@ export function apply(ctx) {
   // 1. UI Automation Tool (`ui`)
   ctx.tools.register(defineTool({
     name: 'ui',
-    description: 'Native HarmonyOS UI automation tool backed by uitest/uinput and in-process overlay management. Launches apps, dumps visible element layout tree with auto-calculated coordinates, clicks by text/id, types Chinese/UTF-8 text, and handles gestures/swipes.',
+    description: 'High-level native HarmonyOS UI automation tool backed by uitest/uinput, CoreVision OCR, and in-process overlay management. Launches apps (supporting split screen), dumps visible element layout tree with auto-calculated coordinates, clicks by ref/text/id/anchor, types Chinese/UTF-8 text, and executes multi-step sequences.',
     parameters: {
       action: {
         type: 'string',
-        enum: ['dump_tree', 'find_and_click', 'click_point', 'click_anchor', 'input_text', 'run_sequence', 'ocr', 'swipe', 'back', 'home', 'launch_app'],
+        enum: [
+          'dump_tree',
+          'find_and_click',
+          'click_point',
+          'click_anchor',
+          'input_text',
+          'run_sequence',
+          'ocr',
+          'swipe',
+          'back',
+          'home',
+          'launch_app',
+          'hide_overlay',
+          'show_overlay',
+          'minimize_overlay'
+        ],
         description: 'UI action to perform',
         required: true
       },
-      bundle_name: { type: 'string', description: 'Target bundle name to isolate layout or launch' },
-      text: { type: 'string', description: 'Visible text or description to match' },
+      bundle_name: { type: 'string', description: 'Target bundle name to isolate layout or launch (e.g. "com.huawei.hmos.notepad")' },
+      ability_name: { type: 'string', description: 'Target UIAbility name for launch_app (default: "EntryAbility")' },
+      text: { type: 'string', description: 'Exact or preferred visible text/hint/description to match' },
+      contains_text: { type: 'string', description: 'Case-insensitive substring match against element text/hint/description/id' },
       id: { type: 'string', description: 'Component resource ID to match' },
-      ref: { type: 'string', description: 'Element reference tag e.g. "@4"' },
-      x: { type: 'number', description: 'X screen coordinate' },
-      y: { type: 'number', description: 'Y screen coordinate' },
-      content: { type: 'string', description: 'Text content to type (supports Chinese)' },
-      direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Swipe direction' },
+      type: { type: 'string', description: 'Component type filter (e.g. "Button", "TextInput", "ListItem")' },
+      ref: { type: 'string', description: 'Element reference tag from dump_tree e.g. "@4" or "4"' },
+      index: { type: 'number', description: '0-based match index when multiple elements match (default: 0)' },
+      clickable_only: { type: 'boolean', description: 'For dump_tree: only show clickable nodes (default: false)' },
+      include_all: { type: 'boolean', description: 'For dump_tree: include unlabeled/non-interactive container nodes (default: false)' },
+      limit: { type: 'number', description: 'For dump_tree: max nodes to return (default: 100)' },
+      use_ocr: { type: 'boolean', description: 'For dump_tree or find_and_click: supplement or fallback to CoreVision OCR' },
+      anchor: {
+        type: 'string',
+        enum: ['search', 'back', 'more', 'chat_input', 'voice_toggle', 'send'],
+        description: 'Visual semantic anchor for click_anchor'
+      },
+      x: { type: 'number', description: 'Screen X coordinate (for click_point or input_text target focus)' },
+      y: { type: 'number', description: 'Screen Y coordinate (for click_point or input_text target focus)' },
+      click_mode: {
+        type: 'string',
+        enum: ['click', 'double', 'long'],
+        description: 'Click variant for find_and_click / click_point (default: "click")'
+      },
+      content: { type: 'string', description: 'Text content to type (supports Chinese/UTF-8)' },
+      clear_first: { type: 'boolean', description: 'For input_text: clear existing text before typing (default: true)' },
+      auto_send: { type: 'boolean', description: 'For input_text: automatically click send button after typing (default: false)' },
+      direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Swipe direction when coordinates are omitted' },
+      x1: { type: 'number', description: 'Swipe start X coordinate' },
+      y1: { type: 'number', description: 'Swipe start Y coordinate' },
+      x2: { type: 'number', description: 'Swipe end X coordinate' },
+      y2: { type: 'number', description: 'Swipe end Y coordinate' },
+      duration_ms: { type: 'number', description: 'Swipe duration in ms (default: 350, range: 100-3000)' },
       steps: {
         type: 'array',
-        description: 'Ordered step objects for run_sequence',
+        description: 'Ordered step objects for run_sequence: {op: "launch"|"tap"|"click_anchor"|"type"|"clear"|"scroll"|"swipe"|"key"|"back"|"wait"|"assert", ...}',
         items: {
           type: 'object',
           additionalProperties: true
@@ -54,155 +182,191 @@ export function apply(ctx) {
       }
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          text: { type: 'string' }
-        }
-      },
-      render: (_args, value) => [{
-        type: 'text',
-        text: typeof value === 'string' ? value : (value?.text || JSON.stringify(value))
-      }]
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
     },
-    async execute(args) {
-      const res = await dispatchSwaiTool('ui', args, 45000);
+    async execute(args, exec) {
+      const res = await dispatchSwaiTool('ui', args, 45000, { signal: exec?.signal });
       return { text: res.ok ? (res.output || 'Success') : `Error: ${res.error || 'UI action failed'}` };
     }
   }));
 
-  // 2. High-Privilege HDC Shell Tool (`bash`)
-  ctx.tools.register(defineTool({
-    name: 'bash',
-    description: 'Executes shell commands directly on the HarmonyOS device with uid=2000 (shell) privileges via Swai loopback HDC bridge. Use this for aa/bm/param/hidumper/system inspection commands.',
-    parameters: {
-      command: { type: 'string', description: 'The shell command line to execute', required: true },
-      bundle_name: { type: 'string', description: 'Optional target bundle context' },
-      timeout: { type: 'number', description: 'Execution timeout in seconds (default 30)' }
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          text: { type: 'string' }
-        }
-      },
-      render: (_args, value) => [{
-        type: 'text',
-        text: typeof value === 'string' ? value : (value?.text || JSON.stringify(value))
-      }]
-    },
-    async execute(args) {
-      const cwd = process.cwd();
-      const rawCmd = (args.command || '').trim();
-      const cmd = (!cwd || rawCmd.startsWith('cd ') || rawCmd.startsWith('cd/') || rawCmd.startsWith('if ! cd '))
-        ? rawCmd
-        : `if ! cd ${JSON.stringify(cwd)} 2>/dev/null; then cd /data/local/tmp 2>/dev/null || true; fi\n${rawCmd}`;
-      const payload = { ...args, command: cmd };
-      const res = await dispatchSwaiTool('bash', payload, ((args.timeout || 30) + 5) * 1000);
-      return { text: res.ok ? res.output : `Exit ${res.exitCode}: ${res.error || res.output}` };
-    }
-  }));
-
-  // 3. Offline Native Code Execution Tool (`offline_code`)
+  // 2. Offline Native Code Execution Tool (`offline_code`)
   ctx.tools.register(defineTool({
     name: 'offline_code',
-    description: 'Executes Python 3 (CPython 3.13) or JavaScript (V8 JSVM) in an isolated offline sandbox. Ideal for math, regex, complex JSON parsing, and data transformation.',
+    description: 'Executes Python 3 (CPython 3.13) or JavaScript (V8 JSVM) in an isolated offline sandbox. Supports inline `code` or a workspace script `path`. Python supports privileged HarmonyOS shell commands via `import hdc; res = hdc.shell("cmd")` or `subprocess.run`, `import pip; pip.install("pkg")`, and graphics with `PIL`.',
     parameters: {
-      code: { type: 'string', description: 'Source code snippet to execute', required: true },
-      language: { type: 'string', enum: ['python', 'javascript'], description: 'Language runtime (default: python)' },
+      path: { type: 'string', description: 'Optional relative or sandbox path of the script file to execute (e.g. "solution.py"). Either `code` or `path` must be provided.' },
+      code: { type: 'string', description: 'Optional source code snippet to execute directly. Either `code` or `path` must be provided.' },
+      language: { type: 'string', enum: ['python', 'javascript'], description: 'Language runtime (default: python, auto-detected from file extension when path is specified)' },
       input_json: { type: 'string', description: 'JSON string injected as __input__ (Python) or input (JS)' },
-      timeout_ms: { type: 'number', description: 'Execution timeout in ms (default 15000)' }
+      timeout_ms: { type: 'number', description: 'Execution timeout in ms (100-60000, default: 15000)' }
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          text: { type: 'string' }
-        }
-      },
-      render: (_args, value) => [{
-        type: 'text',
-        text: typeof value === 'string' ? value : (value?.text || JSON.stringify(value))
-      }]
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
     },
-    async execute(args) {
-      const res = await dispatchSwaiTool('offline_code', args, (args.timeout_ms || 15000) + 3000);
+    async execute(args, exec) {
+      const hasCode = typeof args?.code === 'string' && args.code.trim().length > 0;
+      const hasPath = typeof args?.path === 'string' && args.path.trim().length > 0;
+      if (!hasCode && !hasPath) {
+        return { text: 'Error: Either `code` or `path` must be provided.' };
+      }
+      const timeoutMs = typeof args?.timeout_ms === 'number' && Number.isFinite(args.timeout_ms)
+        ? Math.min(Math.max(Math.round(args.timeout_ms), 100), 60000)
+        : 15000;
+      const res = await dispatchSwaiTool('offline_code', args, timeoutMs + 3000, { signal: exec?.signal });
       return { text: res.ok ? res.output : `Error: ${res.error || 'Execution failed'}` };
     }
   }));
 
-  // 4. Remote Desktop/Server SSH Execution Tool (`remote_bash`)
+  // 3. Remote Desktop/Server SSH Execution Tool (`remote_bash`)
   ctx.tools.register(defineTool({
     name: 'remote_bash',
     description: 'Executes shell commands on a remote desktop/server (Linux/macOS) via native SSH-2.0 over TCP. Use when heavy compilations, npm/pip builds, or git repos are required.',
     parameters: {
       command: { type: 'string', description: 'Remote shell command to execute', required: true },
       work_dir: { type: 'string', description: 'Optional remote directory' },
-      timeout_seconds: { type: 'number', description: 'Timeout in seconds (default 30)' }
+      timeout_seconds: { type: 'number', description: 'Timeout in seconds (3-300, default: 30)' }
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          text: { type: 'string' }
-        }
-      },
-      render: (_args, value) => [{
-        type: 'text',
-        text: typeof value === 'string' ? value : (value?.text || JSON.stringify(value))
-      }]
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
     },
-    async execute(args) {
-      const res = await dispatchSwaiTool('remote_bash', args, ((args.timeout_seconds || 30) + 5) * 1000);
+    async execute(args, exec) {
+      const timeoutSeconds = typeof args?.timeout_seconds === 'number' && Number.isFinite(args.timeout_seconds)
+        ? Math.min(Math.max(Math.round(args.timeout_seconds), 3), 300)
+        : 30;
+      const res = await dispatchSwaiTool('remote_bash', args, (timeoutSeconds + 5) * 1000, { signal: exec?.signal });
       return { text: res.ok ? res.output : `SSH Exit ${res.exitCode}: ${res.error || res.output}` };
     }
   }));
 
-  // 5. Built-in Browser & CDP Automation Tool (`browser`)
+  // 4. Native Hardware Screen Capture Tool (`capture_screen`)
   ctx.tools.register(defineTool({
-    name: 'browser',
-    description: 'Control the built-in ArkWeb browser on the device via Chrome DevTools Protocol (CDP 9222). Allows navigating to webpages (with live visual popup), extracting readable page content, inspecting interactive elements, clicking buttons/links by index or selector, typing text into form fields, evaluating JavaScript in page context, and drafting/publishing WeChat Official Account articles.',
+    name: 'capture_screen',
+    description: 'Captures the current HarmonyOS device screen natively using `snapshot_display` / `uitest screenCap` into the workspace and attaches the image for visual inspection when the active model supports image input.',
     parameters: {
-      action: {
+      output_path: {
         type: 'string',
-        enum: ['navigate', 'snapshot', 'click', 'type', 'evaluate', 'extract_text', 'wechat_publish'],
-        description: 'Browser action to perform: "navigate" (open URL), "snapshot" (extract content & clickable elements), "click" (click element), "type" (input text), "evaluate" (run JS script), "extract_text" (clean text only), "wechat_publish" (draft WeChat article).',
-        required: true
-      },
-      url: { type: 'string', description: 'Target URL to visit (for action: "navigate")' },
-      mode: { type: 'string', enum: ['text', 'interactive', 'both'], description: 'Snapshot mode (default: "both")' },
-      selector: { type: 'string', description: 'CSS selector of the target element' },
-      index: { type: 'number', description: 'Numeric index of element from previous snapshot [1], [2], ...' },
-      text: { type: 'string', description: 'Text to type into input field' },
-      script: { type: 'string', description: 'JavaScript code to execute in the page context' },
-      timeoutMs: { type: 'number', description: 'Navigation timeout in ms (default: 15000)' },
-      title: { type: 'string', description: 'WeChat article title (for wechat_publish)' },
-      content: { type: 'string', description: 'WeChat article content in Markdown/HTML (for wechat_publish)' },
-      author: { type: 'string', description: 'Author name (for wechat_publish)' },
-      summary: { type: 'string', description: 'Article summary (for wechat_publish)' },
-      themeColor: { type: 'string', description: 'Theme color e.g. blue, green, orange, purple (for wechat_publish)' }
+        description: 'Optional destination file path (defaults to a unique .jpeg inside the workspace .tmp directory)'
+      }
     },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
         properties: {
-          text: { type: 'string' }
+          text: { type: 'string', required: true },
+          path: { type: 'string' },
+          image: CAPTURE_IMAGE_VALUE_SCHEMA
         }
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: typeof value === 'string' ? value : (value?.text || JSON.stringify(value))
-      }]
+      render: (_args, value) => {
+        if (value?.image) {
+          return [
+            { type: 'text', text: value.text || `Captured screen to ${value.path || 'file'}.` },
+            { type: 'image', attachment: value.image }
+          ];
+        }
+        return [{ type: 'text', text: value?.text || '' }];
+      },
+      presentationMeta: (_args, value) => (value?.path ? { path: value.path } : undefined)
     },
-    async execute(args) {
-      const res = await dispatchSwaiTool('browser', args, ((args.timeoutMs || 25000) + 5000));
-      return { text: res.ok ? (res.output || 'Browser action completed successfully') : `Error: ${res.error || res.output || 'Browser action failed'}` };
+    async execute(args, exec) {
+      if (exec?.signal?.aborted) {
+        return { text: 'Error: Screen capture aborted.' };
+      }
+
+      const tempDir = resolveWritableTempDir();
+      const rawOut = typeof args?.output_path === 'string' ? args.output_path.trim() : '';
+      const targetPath = rawOut.length > 0
+        ? (path.isAbsolute(rawOut) ? rawOut : path.resolve(process.cwd(), rawOut))
+        : path.join(tempDir, `screen_${Date.now()}_${randomUUID().slice(0, 8)}.jpeg`);
+
+      await fsp.mkdir(path.dirname(targetPath), { recursive: true });
+
+      const escapedTarget = shellSingleQuote(targetPath);
+      const isJpeg = targetPath.toLowerCase().endsWith('.jpeg');
+      const fallbackTmp = shellSingleQuote(path.join(tempDir, `_snap_${randomUUID().slice(0, 8)}.jpeg`));
+      const snapCmd = isJpeg
+        ? `rm -f ${escapedTarget} && (snapshot_display -f ${escapedTarget} >/dev/null 2>&1 || uitest screenCap -p ${escapedTarget} >/dev/null 2>&1) && [ -s ${escapedTarget} ]`
+        : `rm -f ${escapedTarget} ${fallbackTmp} && (uitest screenCap -p ${escapedTarget} >/dev/null 2>&1 || (snapshot_display -f ${fallbackTmp} >/dev/null 2>&1 && mv ${fallbackTmp} ${escapedTarget})) && [ -s ${escapedTarget} ]`;
+
+      const snapRes = await dispatchSwaiTool('bash', { command: snapCmd, timeout_seconds: 15 }, 20000, { signal: exec?.signal });
+      if (!snapRes.ok) {
+        return {
+          text: `Error: Screen capture failed at ${targetPath}: ${snapRes.error || snapRes.output || 'unknown error'}`
+        };
+      }
+
+      let data;
+      try {
+        data = await fsp.readFile(targetPath);
+      } catch (readErr) {
+        return {
+          text: `Screen captured at ${targetPath}, but failed to read file from sandbox: ${readErr?.message || String(readErr)}`,
+          path: targetPath
+        };
+      }
+
+      const mediaType = detectImageMediaType(targetPath, data);
+      const attachments = typeof ctx.get === 'function' ? ctx.get('attachments') : undefined;
+      const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined;
+      const routed = exec?.agent?.session?.requestHeader?.()?.config;
+      const provider = routed?.provider ?? exec?.agent?.options?.provider;
+      const model = routed?.model ?? exec?.agent?.options?.model;
+
+      let supportsImages = false;
+      if (attachments && llm && provider && model && typeof llm.resolveModelInfo === 'function') {
+        try {
+          const active = await llm.resolveModelInfo(provider, model, exec?.signal);
+          supportsImages = Array.isArray(active?.inputModalities) && active.inputModalities.includes('image');
+        } catch (_) {
+          supportsImages = false;
+        }
+      }
+
+      if (supportsImages && attachments && typeof attachments.saveImage === 'function') {
+        try {
+          const ref = await attachments.saveImage({
+            data,
+            mediaType,
+            name: path.basename(targetPath)
+          });
+          const imageValue = {
+            attachmentId: ref.attachmentId,
+            mediaType: ref.mediaType,
+            bytes: Math.trunc(ref.bytes),
+            width: Math.trunc(ref.width),
+            height: Math.trunc(ref.height),
+            ...(ref.name !== undefined ? { name: ref.name } : {}),
+            ...(ref.originalDimensions !== undefined
+              ? {
+                  originalDimensions: {
+                    width: Math.trunc(ref.originalDimensions.width),
+                    height: Math.trunc(ref.originalDimensions.height)
+                  }
+                }
+              : {})
+          };
+          return {
+            text: `Captured screen to ${targetPath} (${imageValue.width}x${imageValue.height}, ${Math.round(imageValue.bytes / 1024)} KB ${imageValue.mediaType}).`,
+            path: targetPath,
+            image: imageValue
+          };
+        } catch (attachErr) {
+          return {
+            text: `Captured screen to ${targetPath} (${data.length} bytes), but failed to attach image (${attachErr?.message || String(attachErr)}). You can inspect UI via ui(action="ocr") or ui(action="dump_tree").`,
+            path: targetPath
+          };
+        }
+      }
+
+      return {
+        text: `Captured screen to ${targetPath} (${data.length} bytes, ${mediaType}). Current model does not support direct image input or attachment service is unavailable; use ui(action="ocr") or ui(action="dump_tree") to inspect screen content.`,
+        path: targetPath
+      };
     }
   }));
 }

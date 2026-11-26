@@ -29,6 +29,16 @@ struct DshHostOptions {
     std::vector<std::string> extra_args;
 };
 
+struct ParsedToolHttpBody {
+    std::string request_id;
+    std::string tool;
+    std::string args_json;
+    int64_t deadline_ms = 0;
+};
+
+bool ParseToolHttpBodyJson(const std::string& body, ParsedToolHttpBody& out);
+int ComputePollTimeoutMs(int64_t deadline_ms, int64_t now_epoch_ms);
+
 class DshHost {
 public:
     static DshHost& GetInstance() {

@@ -164,43 +164,7 @@ export class SwaiMcpServer {
       return { output: txt, isError: false };
     });
 
-    // 7. System Shell (bash with uid 2000)
-    this.registerTool({
-      name: 'bash',
-      description: 'Execute shell commands directly on the HarmonyOS device with uid=2000 (shell) privileges.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          command: { type: 'string', description: 'Shell command line to execute' }
-        },
-        required: ['command']
-      }
-    }, async (args) => {
-      const res = await dispatchSwaiTool('bash', args, 35000);
-      return { output: res.ok ? res.output : `Exit ${res.exitCode}: ${res.error || res.output}`, isError: !res.ok };
-    });
-
-    // 8. HarmonyOS Native UI Automation (ui)
-    this.registerTool({
-      name: 'ui',
-      description: 'Native HarmonyOS UI automation tool backed by uitest and uinput.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          action: { type: 'string', enum: ['dump_tree', 'find_and_click', 'click_point', 'input_text', 'swipe', 'back', 'home'], description: 'UI action' },
-          text: { type: 'string', description: 'Text to match' },
-          x: { type: 'number', description: 'X screen coordinate' },
-          y: { type: 'number', description: 'Y screen coordinate' },
-          content: { type: 'string', description: 'Text content to type' }
-        },
-        required: ['action']
-      }
-    }, async (args) => {
-      const res = await dispatchSwaiTool('ui', args, 45000);
-      return { output: res.ok ? (res.output || 'Success') : `Error: ${res.error || 'UI action failed'}`, isError: !res.ok };
-    });
-
-    // 9. WeChat Article Renderer (wechat_render_article)
+    // 7. WeChat Article Renderer (wechat_render_article)
     this.registerTool({
       name: 'wechat_render_article',
       description: 'Convert Markdown into WeChat Official Account ready HTML with beautiful inline CSS styles (baoyu-md engine).',
@@ -235,7 +199,7 @@ export class SwaiMcpServer {
       }
     });
 
-    // 10. WeChat Article Draft Publisher (wechat_post_draft)
+    // 8. WeChat Article Draft Publisher (wechat_post_draft)
     this.registerTool({
       name: 'wechat_post_draft',
       description: 'Automatically publish or save a Markdown article to WeChat Official Account (微信公众号) draft box via ArkWeb browser automation.',

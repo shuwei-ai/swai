@@ -3,6 +3,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#include "../dsh_host.h"
 #include "../dsh_state.h"
 #include <cassert>
 #include <iostream>
@@ -101,6 +102,46 @@ int main() {
     rc = dsh_host_piha_v1(&cancel_in, &cancel_out);
     assert(rc == 1);
     assert(cancel_out.status == 3); // cancelled
+
+    // 10. Test ParseToolHttpBodyJson with nested decoy keys & escaped quotes
+    {
+        swshell::ParsedToolHttpBody parsed;
+        std::string payload = R"({
+            "args": {
+                "command": "echo \"tool\":\"evil\" \"requestId\":\"fake\" \"deadlineMs\":1",
+                "nested": {"tool": "nested_tool", "deadlineMs": 42}
+            },
+            "deadlineMs": 1799999999000,
+            "tool": "remote_bash",
+            "requestId": "real-req-999"
+        })";
+        bool ok = swshell::ParseToolHttpBodyJson(payload, parsed);
+        assert(ok);
+        assert(parsed.request_id == "real-req-999");
+        assert(parsed.tool == "remote_bash");
+        assert(parsed.deadline_ms == 1799999999000LL);
+        assert(parsed.args_json.find("\"nested_tool\"") != std::string::npos);
+        assert(parsed.args_json.front() == '{' && parsed.args_json.back() == '}');
+    }
+
+    // 11. Test ParseToolHttpBodyJson with normal key order & unicode escapes
+    {
+        swshell::ParsedToolHttpBody parsed;
+        std::string payload = "{\"requestId\":\"req-u1\",\"tool\":\"ui\",\"args\":{\"text\":\"\\u4e2d\\u6587\"},\"deadlineMs\":5000}";
+        bool ok = swshell::ParseToolHttpBodyJson(payload, parsed);
+        assert(ok);
+        assert(parsed.request_id == "req-u1");
+        assert(parsed.tool == "ui");
+        assert(parsed.deadline_ms == 5000);
+        assert(parsed.args_json == "{\"text\":\"\\u4e2d\\u6587\"}");
+    }
+
+    // 12. Test ComputePollTimeoutMs clamping & defaults
+    assert(swshell::ComputePollTimeoutMs(0, 1000000) == 60000);
+    assert(swshell::ComputePollTimeoutMs(-5, 1000000) == 60000);
+    assert(swshell::ComputePollTimeoutMs(1180000, 1000000) == 180000);
+    assert(swshell::ComputePollTimeoutMs(1500000, 1000000) == 310000);
+    assert(swshell::ComputePollTimeoutMs(999000, 1000000) == 1000);
 
     std::cout << "All DshBridge and C ABI tests PASSED successfully!" << std::endl;
     return 0;

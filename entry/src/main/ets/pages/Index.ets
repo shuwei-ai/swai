@@ -4176,7 +4176,6 @@ struct Index {
         .width(24)
         .height(52)
         .position({ x: 0, y: '48%' })
-        .shadow({ radius: 8, color: 'rgba(0, 0, 0, 0.2)', offsetX: 2, offsetY: 1 })
         .onClick(() => {
           this.isDrawerOpen = true;
         })

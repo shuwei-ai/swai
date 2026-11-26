@@ -17,6 +17,7 @@ import { BridgeController } from '../../common/BridgeController';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'AgentWorkspace';
+const DSH_RUNTIME_VERSION: string = '0.2.3-alpha.2';
 
 export class AgentWorkspace {
   private static instance: AgentWorkspace = new AgentWorkspace();
@@ -148,15 +149,33 @@ export class AgentWorkspace {
     }
     const runtimeDir = `${this.context.filesDir}/dsh-runtime`;
     const binJs = `${runtimeDir}/node_modules/@deepseek-ai/dsh/lib/bin.js`;
+    const dshPkgJson = `${runtimeDir}/node_modules/@deepseek-ai/dsh/package.json`;
 
     let alreadyExtracted = false;
+    let installedVersion = '';
     try {
-      alreadyExtracted = fs.accessSync(binJs);
+      if (fs.accessSync(binJs) && fs.accessSync(dshPkgJson)) {
+        const pkgContent = fs.readTextSync(dshPkgJson);
+        const pkgObj = JSON.parse(pkgContent) as Record<string, Object>;
+        if (pkgObj && typeof pkgObj.version === 'string') {
+          installedVersion = pkgObj.version as string;
+        }
+        alreadyExtracted = (installedVersion === DSH_RUNTIME_VERSION);
+      }
     } catch (_e) {
       alreadyExtracted = false;
     }
 
     if (!alreadyExtracted) {
+      hilog.info(DOMAIN, TAG, 'Updating dsh-runtime from %{public}s to %{public}s',
+        installedVersion || 'none', DSH_RUNTIME_VERSION);
+      try {
+        if (fs.accessSync(runtimeDir)) {
+          fs.rmdirSync(runtimeDir);
+        }
+      } catch (_rmErr) {
+        hilog.warn(DOMAIN, TAG, 'Failed to clean old dsh-runtime dir: %{public}s', `${_rmErr}`);
+      }
       try {
         const zipDest = `${this.context.filesDir}/dsh-runtime.zip`;
         hilog.info(DOMAIN, TAG, 'Extracting dsh-runtime.zip from rawfile...');
@@ -217,8 +236,6 @@ export class AgentWorkspace {
       ['dsh_bridge/swai-host.patch.json', `${runtimeDir}/bridge/piha-host.patch.json`],
       ['dsh_bridge/swai-mcp-server.mjs', `${runtimeDir}/bridge/swai-mcp-server.mjs`],
       ['dsh_bridge/swai-mcp-server.mjs', `${runtimeDir}/bridge/piha-mcp-server.mjs`],
-      ['dsh_bridge/swai-subprocess.mjs', `${runtimeDir}/bridge/swai-subprocess.mjs`],
-      ['dsh_bridge/swai-subprocess.mjs', `${runtimeDir}/bridge/piha-subprocess.mjs`],
       ['dsh_bridge/cdp-driver.mjs', `${runtimeDir}/bridge/cdp-driver.mjs`],
       ['dsh_bridge/wechat-formatter.mjs', `${runtimeDir}/bridge/wechat-formatter.mjs`],
       ['dsh_bridge/wechat-poster.mjs', `${runtimeDir}/bridge/wechat-poster.mjs`]
@@ -257,28 +274,45 @@ export class AgentWorkspace {
       // ignore
     }
 
-    // Always enforce local auth bypass in dsh-client-connection to prevent ArkWeb cookie loss on 127.0.0.1
+    // Always enforce local auth bypass in dsh-host-authentication-token (or legacy dsh-client-connection)
+    // to prevent ArkWeb cookie loss on 127.0.0.1. Never short-circuit authorizeIndex so GET /?token=... still responds 303.
     try {
-      const clientConnPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-client-connection/lib/index.js`;
-      if (fs.accessSync(clientConnPath)) {
-        let curContent = fs.readTextSync(clientConnPath);
+      const authTokenPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-host-authentication-token/lib/index.js`;
+      if (fs.accessSync(authTokenPath)) {
+        let curContent = fs.readTextSync(authTokenPath);
         if (!curContent.includes('SWAI_AUTH_BYPASS')) {
-          curContent = curContent.replace(
-            'authorizeIndex(req, res, secure = false) {',
-            'authorizeIndex(req, res, secure = false) { /* SWAI_AUTH_BYPASS */ return true;'
-          );
-          curContent = curContent.replace(
-            'isAuthenticated(request, secure = false) {',
-            'isAuthenticated(request, secure = false) { /* SWAI_AUTH_BYPASS */ return true;'
-          );
-          const file = fs.openSync(clientConnPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-          fs.writeSync(file.fd, curContent);
-          fs.closeSync(file);
-          hilog.info(DOMAIN, TAG, 'Enforced SWAI_AUTH_BYPASS at %{public}s', clientConnPath);
+          const authTarget = 'isAuthenticated(request, secure = false) {';
+          if (curContent.includes(authTarget)) {
+            curContent = curContent.replace(
+              authTarget,
+              'isAuthenticated(request, secure = false) { /* SWAI_AUTH_BYPASS */ return true;'
+            );
+            const file = fs.openSync(authTokenPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced SWAI_AUTH_BYPASS at %{public}s', authTokenPath);
+          } else {
+            hilog.warn(DOMAIN, TAG, 'SWAI_AUTH_BYPASS target not found in %{public}s', authTokenPath);
+          }
+        }
+      } else {
+        const clientConnPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-client-connection/lib/index.js`;
+        if (fs.accessSync(clientConnPath)) {
+          let curContent = fs.readTextSync(clientConnPath);
+          if (!curContent.includes('SWAI_AUTH_BYPASS') && curContent.includes('isAuthenticated(request, secure = false) {')) {
+            curContent = curContent.replace(
+              'isAuthenticated(request, secure = false) {',
+              'isAuthenticated(request, secure = false) { /* SWAI_AUTH_BYPASS */ return true;'
+            );
+            const file = fs.openSync(clientConnPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced legacy SWAI_AUTH_BYPASS at %{public}s', clientConnPath);
+          }
         }
       }
     } catch (_authBypassErr) {
-      // ignore
+      hilog.warn(DOMAIN, TAG, 'Failed to patch auth bypass: %{public}s', `${_authBypassErr}`);
     }
 
     // Always enforce window.open shim in dsh-web-frontend/dist/index.html to prevent white screen on login
@@ -398,11 +432,15 @@ export class AgentWorkspace {
   }, true);
 })();
 </script>`;
-          html = html.replace('<head>', '<head>\n    ' + shim);
-          const file = fs.openSync(indexHtmlPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-          fs.writeSync(file.fd, html);
-          fs.closeSync(file);
-          hilog.info(DOMAIN, TAG, 'Successfully injected swai-window-open-shim into %{public}s', indexHtmlPath);
+          if (html.includes('<head>')) {
+            html = html.replace('<head>', '<head>\n    ' + shim);
+            const file = fs.openSync(indexHtmlPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, html);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Successfully injected swai-window-open-shim into %{public}s', indexHtmlPath);
+          } else {
+            hilog.warn(DOMAIN, TAG, 'swai-window-open-shim <head> target not found in %{public}s', indexHtmlPath);
+          }
         }
       }
     } catch (e) {
@@ -420,14 +458,27 @@ export class AgentWorkspace {
       if (fs.accessSync(workingDirJsPath)) {
         let curContent = fs.readTextSync(workingDirJsPath);
         if (!curContent.includes('SWAI_DIR_FALLBACK')) {
-          curContent = curContent.replace(
-            'if (info?.type !== "directory") throw new Error(`working-directory: directory does not exist: ${JSON.stringify(path)}`);',
-            '/* SWAI_DIR_FALLBACK */ if (info?.type !== "directory") { try { const _fs = require("node:fs"); const _p = this.ctx.fs.processPath(target); _fs.mkdirSync(_p, { recursive: true }); return _p; } catch(_e){} return this.defaultDirectory; }'
-          );
-          const file = fs.openSync(workingDirJsPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-          fs.writeSync(file.fd, curContent);
-          fs.closeSync(file);
-          hilog.info(DOMAIN, TAG, 'Enforced SWAI_DIR_FALLBACK at %{public}s', workingDirJsPath);
+          const targetNew = 'if (info?.type !== "directory") throw missing();';
+          const targetLegacy = 'if (info?.type !== "directory") throw new Error(`working-directory: directory does not exist: ${JSON.stringify(path)}`);';
+          const importPrefix = curContent.includes('__swaiMkdirSync')
+            ? ''
+            : 'import { mkdirSync as __swaiMkdirSync } from "node:fs";\n';
+          const replacement = '/* SWAI_DIR_FALLBACK */ if (info?.type !== "directory") { try { const _p = this.ctx.fs.processPath(target); __swaiMkdirSync(_p, { recursive: true }); return _p; } catch(_e) {} return this.defaultDirectory; }';
+          if (curContent.includes(targetNew)) {
+            curContent = importPrefix + curContent.replace(targetNew, replacement);
+            const file = fs.openSync(workingDirJsPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced SWAI_DIR_FALLBACK at %{public}s', workingDirJsPath);
+          } else if (curContent.includes(targetLegacy)) {
+            curContent = importPrefix + curContent.replace(targetLegacy, replacement);
+            const file = fs.openSync(workingDirJsPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced legacy SWAI_DIR_FALLBACK at %{public}s', workingDirJsPath);
+          } else {
+            hilog.warn(DOMAIN, TAG, 'SWAI_DIR_FALLBACK target not found in %{public}s', workingDirJsPath);
+          }
         }
       }
     } catch (e) {
@@ -457,6 +508,8 @@ export class AgentWorkspace {
             fs.writeSync(file.fd, curContent);
             fs.closeSync(file);
             hilog.info(DOMAIN, TAG, 'Enforced SWAI_NATIVE_FS_SEARCH at %{public}s', searchJsPath);
+          } else {
+            hilog.warn(DOMAIN, TAG, 'SWAI_NATIVE_FS_SEARCH target not found in %{public}s', searchJsPath);
           }
         }
       }
@@ -477,14 +530,24 @@ export class AgentWorkspace {
       if (fs.accessSync(resClientPath)) {
         let curContent = fs.readTextSync(resClientPath);
         if (!curContent.includes('SWAI_RESOURCE_URL_FIX')) {
-          const target = 'return parsed.hostname === "" ? void 0 : parsed.hostname.toLowerCase();';
-          const replacement = '/* SWAI_RESOURCE_URL_FIX */ if (parsed.hostname !== "") return parsed.hostname.toLowerCase(); const _swaiProto = /^\\/\\/([^/?#]+)(?:[/?#]|$)/.exec(parsed.pathname); return _swaiProto ? _swaiProto[1].toLowerCase() : void 0;';
-          if (curContent.includes(target)) {
-            curContent = curContent.replace(target, replacement);
+          const targetMin = 'return parsed.hostname===``?void 0:parsed.hostname.toLowerCase()';
+          const replacementMin = '/* SWAI_RESOURCE_URL_FIX */ if(parsed.hostname!==``)return parsed.hostname.toLowerCase();const _swaiProto=/^\\/\\/([^/?#]+)(?:[/?#]|$)/.exec(parsed.pathname);return _swaiProto?_swaiProto[1].toLowerCase():void 0';
+          const targetLegacy = 'return parsed.hostname === "" ? void 0 : parsed.hostname.toLowerCase();';
+          const replacementLegacy = '/* SWAI_RESOURCE_URL_FIX */ if (parsed.hostname !== "") return parsed.hostname.toLowerCase(); const _swaiProto = /^\\/\\/([^/?#]+)(?:[/?#]|$)/.exec(parsed.pathname); return _swaiProto ? _swaiProto[1].toLowerCase() : void 0;';
+          if (curContent.includes(targetMin)) {
+            curContent = curContent.replace(targetMin, replacementMin);
             const file = fs.openSync(resClientPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
             fs.writeSync(file.fd, curContent);
             fs.closeSync(file);
             hilog.info(DOMAIN, TAG, 'Enforced SWAI_RESOURCE_URL_FIX at %{public}s', resClientPath);
+          } else if (curContent.includes(targetLegacy)) {
+            curContent = curContent.replace(targetLegacy, replacementLegacy);
+            const file = fs.openSync(resClientPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced legacy SWAI_RESOURCE_URL_FIX at %{public}s', resClientPath);
+          } else {
+            hilog.warn(DOMAIN, TAG, 'SWAI_RESOURCE_URL_FIX target not found in %{public}s', resClientPath);
           }
         }
       }
@@ -498,14 +561,24 @@ export class AgentWorkspace {
       if (fs.accessSync(sidebarClientPath)) {
         let curContent = fs.readTextSync(sidebarClientPath);
         if (!curContent.includes('SWAI_SIDEBAR_URL_FIX')) {
-          const target = 'function pathOf(address) {\n\t\t\ttry {\n\t\t\t\treturn new URL(address).pathname;';
-          const replacement = 'function pathOf(address) {\n\t\t\t/* SWAI_SIDEBAR_URL_FIX */\n\t\t\ttry {\n\t\t\t\tconst _u = new URL(address);\n\t\t\t\tif (_u.hostname === "" && _u.pathname.startsWith("//") && !_u.pathname.startsWith("///")) return _u.pathname.replace(/^\\/\\/[^/]*/, "");\n\t\t\t\treturn _u.pathname;';
-          if (curContent.includes(target)) {
-            curContent = curContent.replace(target, replacement);
+          const targetMin = 'function pathOf(address){try{return new URL(address).pathname}';
+          const replacementMin = 'function pathOf(address){/* SWAI_SIDEBAR_URL_FIX */try{const _u=new URL(address);if(_u.hostname===""&&_u.pathname.startsWith("//")&&!_u.pathname.startsWith("///"))return _u.pathname.replace(/^\\/\\/[^/]*/,"");return _u.pathname}';
+          const targetLegacy = 'function pathOf(address) {\n\t\t\ttry {\n\t\t\t\treturn new URL(address).pathname;';
+          const replacementLegacy = 'function pathOf(address) {\n\t\t\t/* SWAI_SIDEBAR_URL_FIX */\n\t\t\ttry {\n\t\t\t\tconst _u = new URL(address);\n\t\t\t\tif (_u.hostname === "" && _u.pathname.startsWith("//") && !_u.pathname.startsWith("///")) return _u.pathname.replace(/^\\/\\/[^/]*/, "");\n\t\t\t\treturn _u.pathname;';
+          if (curContent.includes(targetMin)) {
+            curContent = curContent.replace(targetMin, replacementMin);
             const file = fs.openSync(sidebarClientPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
             fs.writeSync(file.fd, curContent);
             fs.closeSync(file);
             hilog.info(DOMAIN, TAG, 'Enforced SWAI_SIDEBAR_URL_FIX at %{public}s', sidebarClientPath);
+          } else if (curContent.includes(targetLegacy)) {
+            curContent = curContent.replace(targetLegacy, replacementLegacy);
+            const file = fs.openSync(sidebarClientPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced legacy SWAI_SIDEBAR_URL_FIX at %{public}s', sidebarClientPath);
+          } else {
+            hilog.warn(DOMAIN, TAG, 'SWAI_SIDEBAR_URL_FIX target not found in %{public}s', sidebarClientPath);
           }
         }
       }
@@ -519,14 +592,24 @@ export class AgentWorkspace {
       if (fs.accessSync(subagentClientPath)) {
         let curContent = fs.readTextSync(subagentClientPath);
         if (!curContent.includes('SWAI_SUBAGENT_URL_FIX')) {
-          const target = 'if (url.protocol !== "dsh-resource:" || url.hostname.toLowerCase() !== "subagentchat") return void 0;\n\t\t\tconst parts = url.pathname.split("/").filter(Boolean);';
-          const replacement = '/* SWAI_SUBAGENT_URL_FIX */ const _swaiHost = url.hostname !== "" ? url.hostname : (/^\\/\\/([^/?#]+)/.exec(url.pathname)?.[1] ?? ""); const _swaiPath = url.hostname !== "" ? url.pathname : url.pathname.replace(/^\\/\\/[^/]*/, "");\n\t\t\tif (url.protocol !== "dsh-resource:" || _swaiHost.toLowerCase() !== "subagentchat") return void 0;\n\t\t\tconst parts = _swaiPath.split("/").filter(Boolean);';
-          if (curContent.includes(target)) {
-            curContent = curContent.replace(target, replacement);
+          const targetMin = 'if(url.protocol!==`dsh-resource:`||url.hostname.toLowerCase()!==`subagentchat`)return void 0;const parts=url.pathname.split(`/`).filter(Boolean);';
+          const replacementMin = '/* SWAI_SUBAGENT_URL_FIX */const _swaiHost=url.hostname!==""?url.hostname:(/^\\/\\/([^/?#]+)/.exec(url.pathname)?.[1]??"");const _swaiPath=url.hostname!==""?url.pathname:url.pathname.replace(/^\\/\\/[^/]*/,"");if(url.protocol!=="dsh-resource:"||_swaiHost.toLowerCase()!=="subagentchat")return void 0;const parts=_swaiPath.split("/").filter(Boolean);';
+          const targetLegacy = 'if (url.protocol !== "dsh-resource:" || url.hostname.toLowerCase() !== "subagentchat") return void 0;\n\t\t\tconst parts = url.pathname.split("/").filter(Boolean);';
+          const replacementLegacy = '/* SWAI_SUBAGENT_URL_FIX */ const _swaiHost = url.hostname !== "" ? url.hostname : (/^\\/\\/([^/?#]+)/.exec(url.pathname)?.[1] ?? ""); const _swaiPath = url.hostname !== "" ? url.pathname : url.pathname.replace(/^\\/\\/[^/]*/, "");\n\t\t\tif (url.protocol !== "dsh-resource:" || _swaiHost.toLowerCase() !== "subagentchat") return void 0;\n\t\t\tconst parts = _swaiPath.split("/").filter(Boolean);';
+          if (curContent.includes(targetMin)) {
+            curContent = curContent.replace(targetMin, replacementMin);
             const file = fs.openSync(subagentClientPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
             fs.writeSync(file.fd, curContent);
             fs.closeSync(file);
             hilog.info(DOMAIN, TAG, 'Enforced SWAI_SUBAGENT_URL_FIX at %{public}s', subagentClientPath);
+          } else if (curContent.includes(targetLegacy)) {
+            curContent = curContent.replace(targetLegacy, replacementLegacy);
+            const file = fs.openSync(subagentClientPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced legacy SWAI_SUBAGENT_URL_FIX at %{public}s', subagentClientPath);
+          } else {
+            hilog.warn(DOMAIN, TAG, 'SWAI_SUBAGENT_URL_FIX target not found in %{public}s', subagentClientPath);
           }
         }
       }
@@ -565,6 +648,8 @@ export class AgentWorkspace {
             fs.writeSync(file.fd, curContent);
             fs.closeSync(file);
             hilog.info(DOMAIN, TAG, 'Enforced SWAI_SANDBOX_ALIAS_FIX_V2 at %{public}s', fsLocalPath);
+          } else {
+            hilog.warn(DOMAIN, TAG, 'SWAI_SANDBOX_ALIAS_FIX_V2 targets not found in %{public}s', fsLocalPath);
           }
         }
       }
@@ -596,6 +681,8 @@ export class AgentWorkspace {
               '/* SWAI_SHARP_BRIDGE_V1 */ const requireSharp = () => __swaiSharp;'
             );
             modified = true;
+          } else {
+            hilog.warn(DOMAIN, TAG, 'SWAI_SHARP_BRIDGE_V1 target not found in %{public}s', attachLocalPath);
           }
         }
 
@@ -605,6 +692,8 @@ export class AgentWorkspace {
           if (curContent.includes(targetSync)) {
             curContent = curContent.replace(targetSync, replacementSync);
             modified = true;
+          } else {
+            hilog.warn(DOMAIN, TAG, 'SWAI_SYNC_DIR_SAFE target not found in %{public}s', attachLocalPath);
           }
         }
 

@@ -187,3 +187,10 @@ target_link_libraries(swshell PUBLIC
     libuv.so
     libjsvm.so
 )
+
+# Prevent statically linked OpenSSL 1.1.1w symbols from leaking into libswshell.so's
+# dynamic symbol table where they could collide with libnode.so's OpenSSL 3.0.x.
+target_link_options(swshell PRIVATE
+    -Wl,--exclude-libs,libssl.a
+    -Wl,--exclude-libs,libcrypto.a
+)
