@@ -9,6 +9,7 @@
  */
 import { dshHostClaimNative, dshHostFinishNative, DshToolClaimResult, DshToolFinishInput } from '../../common/NativeBridge';
 import { ToolRegistry } from '../tools/ToolRegistry';
+import { DshImageProcessor } from './DshImageProcessor';
 import { ToolCall, ToolResult } from '../types';
 import hilog from '@ohos.hilog';
 
@@ -73,6 +74,20 @@ export class DshToolBridge {
   private async handleClaim(claim: DshToolClaimResult): Promise<void> {
     const toolName = claim.tool;
     const reqId = claim.requestId;
+
+    // Internal silent bridge for DSH attachment image verification & normalization
+    if (toolName === 'dsh_image_op') {
+      const imgRes = await DshImageProcessor.execute(claim.argsJson || '{}');
+      dshHostFinishNative({
+        requestId: reqId,
+        success: imgRes.ok,
+        output: imgRes.output,
+        error: imgRes.error,
+        exitCode: imgRes.ok ? 0 : 1
+      });
+      return;
+    }
+
     let actionDesc = '';
 
     try {

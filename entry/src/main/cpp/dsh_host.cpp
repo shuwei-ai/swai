@@ -43,10 +43,10 @@ static struct sigaction g_prev_sigsys;
 static void HandleSigsys(int sig, siginfo_t* info, void* ucontext_raw) {
     if (sig == SIGSYS && ucontext_raw && info) {
         auto* uc = reinterpret_cast<ucontext_t*>(ucontext_raw);
-        // Emulate return value -ENOSYS in register x0
+        // Emulate return value -ENOSYS in register x0.
+        // Note: On ARM64 Linux/OpenHarmony, SECCOMP_RET_TRAP delivers SIGSYS with
+        // uc->uc_mcontext.pc already pointing past the 4-byte `svc #0` instruction.
         uc->uc_mcontext.regs[0] = static_cast<unsigned long>(-ENOSYS);
-        // Advance PC past the 4-byte svc #0 instruction
-        uc->uc_mcontext.pc += 4;
         OH_LOG_Print(LOG_APP, LOG_WARN, 0x3201, "DSHHost",
                      "Emulated ENOSYS for blocked seccomp syscall: %{public}d",
                      info->si_syscall);
@@ -267,11 +267,17 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
             std::string dsh_dir = options.workspace_root + "/.dsh";
             mkdir(dsh_dir.c_str(), 0777);
             chmod(dsh_dir.c_str(), 0777);
+            std::string tmp_dir = options.workspace_root + "/.tmp";
+            mkdir(tmp_dir.c_str(), 0777);
+            chmod(tmp_dir.c_str(), 0777);
             chdir(options.workspace_root.c_str());
             umask(0);
 
             setenv("HOME", options.workspace_root.c_str(), 1);
             setenv("DSH_HOME", dsh_dir.c_str(), 1);
+            setenv("TMPDIR", tmp_dir.c_str(), 1);
+            setenv("TMP", tmp_dir.c_str(), 1);
+            setenv("TEMP", tmp_dir.c_str(), 1);
 
             // Write $DSH_HOME/cordis.patch.yml so DSH automatically loads Swai tools/mcp
             std::string home_patch_yml = dsh_dir + "/cordis.patch.yml";
@@ -325,7 +331,31 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "    get() { return dummyStdin; }\n"
                 "  });\n"
                 "} catch (e) { writeLog('PRELOAD_ERR', 'stdin: ' + e); }\n"
+                "let dshServerReady = false;\n"
+                "if (typeof globalThis.WebAssembly === 'undefined') {\n"
+                "  const wasmUnavailable = () => Promise.reject(new Error('WebAssembly is disabled in --jitless mode'));\n"
+                "  const WasmStub = function() { throw new Error('WebAssembly is disabled in --jitless mode'); };\n"
+                "  globalThis.WebAssembly = {\n"
+                "    compile: wasmUnavailable,\n"
+                "    compileStreaming: wasmUnavailable,\n"
+                "    instantiate: wasmUnavailable,\n"
+                "    instantiateStreaming: wasmUnavailable,\n"
+                "    validate: () => false,\n"
+                "    Module: WasmStub,\n"
+                "    Instance: WasmStub,\n"
+                "    Memory: WasmStub,\n"
+                "    Table: WasmStub,\n"
+                "    Global: WasmStub,\n"
+                "    Tag: WasmStub,\n"
+                "    Exception: WasmStub,\n"
+                "    CompileError: Error,\n"
+                "    LinkError: Error,\n"
+                "    RuntimeError: Error\n"
+                "  };\n"
+                "  writeLog('PRELOAD_WASM', 'Installed jitless WebAssembly safety stub');\n"
+                "}\n"
                 "const signalHandlers = new Map();\n"
+                "const crashListenerMap = new WeakMap();\n"
                 "const origOn = process.on.bind(process);\n"
                 "const origAddListener = process.addListener.bind(process);\n"
                 "const origPrepend = process.prependListener.bind(process);\n"
@@ -333,6 +363,25 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "const origRemove = process.removeListener.bind(process);\n"
                 "function isSignal(name) {\n"
                 "  return typeof name === 'string' && /^SIG[A-Z0-9]+$/.test(name);\n"
+                "}\n"
+                "function wrapCrashListener(ev, fn) {\n"
+                "  if ((ev === 'unhandledRejection' || ev === 'uncaughtException') && typeof fn === 'function') {\n"
+                "    let wrapped = crashListenerMap.get(fn);\n"
+                "    if (!wrapped) {\n"
+                "      wrapped = function(...cargs) {\n"
+                "        if (dshServerReady) {\n"
+                "          const reason = cargs[0];\n"
+                "          const detail = reason && reason.stack ? reason.stack : String(reason);\n"
+                "          writeLog('ISOLATED_RUNTIME_ERR', `Prevented ${ev} from tearing down live DSH server: ${detail}`);\n"
+                "          return;\n"
+                "        }\n"
+                "        return fn.apply(this, cargs);\n"
+                "      };\n"
+                "      crashListenerMap.set(fn, wrapped);\n"
+                "    }\n"
+                "    return wrapped;\n"
+                "  }\n"
+                "  return fn;\n"
                 "}\n"
                 "function handleSignal(ev, fn, once) {\n"
                 "  if (isSignal(ev)) {\n"
@@ -346,19 +395,19 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "}\n"
                 "process.on = function(ev, fn) {\n"
                 "  if (handleSignal(ev, fn, false)) return process;\n"
-                "  return origOn.apply(this, arguments);\n"
+                "  return origOn.call(this, ev, wrapCrashListener(ev, fn));\n"
                 "};\n"
                 "process.addListener = function(ev, fn) {\n"
                 "  if (handleSignal(ev, fn, false)) return process;\n"
-                "  return origAddListener.apply(this, arguments);\n"
+                "  return origAddListener.call(this, ev, wrapCrashListener(ev, fn));\n"
                 "};\n"
                 "process.prependListener = function(ev, fn) {\n"
                 "  if (handleSignal(ev, fn, false)) return process;\n"
-                "  return origPrepend.apply(this, arguments);\n"
+                "  return origPrepend.call(this, ev, wrapCrashListener(ev, fn));\n"
                 "};\n"
                 "process.once = function(ev, fn) {\n"
                 "  if (handleSignal(ev, fn, true)) return process;\n"
-                "  return origOnce.apply(this, arguments);\n"
+                "  return origOnce.call(this, ev, wrapCrashListener(ev, fn));\n"
                 "};\n"
                 "process.removeListener = function(ev, fn) {\n"
                 "  if (isSignal(ev)) {\n"
@@ -366,7 +415,7 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "    signalHandlers.set(ev, list.filter(item => item.fn !== fn));\n"
                 "    return process;\n"
                 "  }\n"
-                "  return origRemove.apply(this, arguments);\n"
+                "  return origRemove.call(this, ev, crashListenerMap.get(fn) || fn);\n"
                 "};\n"
                 "process.off = process.removeListener;\n"
                 "const origKill = process.kill ? process.kill.bind(process) : null;\n"
@@ -388,6 +437,7 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "      const str = chunk.toString();\n"
                 "      const m = str.match(/http:\\/\\/127\\.0\\.0\\.1:(\\d+)\\/\\?token=([a-zA-Z0-9_\\-]+)/);\n"
                 "      if (m) {\n"
+                "        dshServerReady = true;\n"
                 "        const info = {\n"
                 "          phase: 'running',\n"
                 "          port: parseInt(m[1], 10),\n"
@@ -414,12 +464,12 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "    return origStderrWrite(chunk, encoding, cb);\n"
                 "  };\n"
                 "} catch(e) {}\n"
-                "process.on('uncaughtException', (err, origin) => {\n"
+                "origOn('uncaughtException', (err, origin) => {\n"
                 "  const msg = err && err.stack ? err.stack : String(err);\n"
                 "  writeLog('UNCAUGHT_EXCEPTION', `${origin} - ${msg}`);\n"
                 "  console.error('DSH UNCAUGHT EXCEPTION:', origin, msg);\n"
                 "});\n"
-                "process.on('unhandledRejection', (reason) => {\n"
+                "origOn('unhandledRejection', (reason) => {\n"
                 "  const msg = reason && reason.stack ? reason.stack : String(reason);\n"
                 "  writeLog('UNHANDLED_REJECTION', msg);\n"
                 "  console.error('DSH UNHANDLED REJECTION:', msg);\n"
@@ -522,37 +572,18 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "        }\n"
                 "      };\n"
                 "    }\n"
+                "    if (h && typeof h.sync === 'function') {\n"
+                "      const origHSync = h.sync.bind(h);\n"
+                "      h.sync = async function(...sargs) {\n"
+                "        try { return await origHSync.apply(this, sargs); } catch(err) {\n"
+                "          if (err && (err.code === 'EINVAL' || err.code === 'EBADF' || err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'EROFS' || err.code === 'ENOSYS')) return;\n"
+                "          throw err;\n"
+                "        }\n"
+                "      };\n"
+                "    }\n"
                 "    return h;\n"
                 "  };\n"
                 "} catch(e) { writeLog('PRELOAD_LINK_ERR', 'link/chmod shim: ' + e); }\n"
-                "try {\n"
-                "  const origFspStat = fsp.stat;\n"
-                "  fsp.stat = async function(p, opts) {\n"
-                "    try { return await origFspStat.call(this, p, opts); } catch (err) {\n"
-                "      if (err && err.code === 'ENOENT' && typeof p === 'string') {\n"
-                "        const pNorm = p.split('\\\\').join('/');\n"
-                "        const homeNorm = (home || '').split('\\\\').join('/');\n"
-                "        if (pNorm.includes('/workspace/workspace') || pNorm.endsWith(' ') || (homeNorm && pNorm.startsWith(homeNorm) && (pNorm.endsWith('/workspace') || pNorm.includes('/workspace/')))) {\n"
-                "          try { fs.mkdirSync(p, { recursive: true }); return await origFspStat.call(this, p, opts); } catch(_e) {}\n"
-                "        }\n"
-                "      }\n"
-                "      throw err;\n"
-                "    }\n"
-                "  };\n"
-                "  const origFsStatSync = fs.statSync;\n"
-                "  fs.statSync = function(p, opts) {\n"
-                "    try { return origFsStatSync.call(this, p, opts); } catch (err) {\n"
-                "      if (err && err.code === 'ENOENT' && typeof p === 'string') {\n"
-                "        const pNorm = p.split('\\\\').join('/');\n"
-                "        const homeNorm = (home || '').split('\\\\').join('/');\n"
-                "        if (pNorm.includes('/workspace/workspace') || pNorm.endsWith(' ') || (homeNorm && pNorm.startsWith(homeNorm) && (pNorm.endsWith('/workspace') || pNorm.includes('/workspace/')))) {\n"
-                "          try { fs.mkdirSync(p, { recursive: true }); return origFsStatSync.call(this, p, opts); } catch(_e) {}\n"
-                "        }\n"
-                "      }\n"
-                "      throw err;\n"
-                "    }\n"
-                "  };\n"
-                "} catch(e) { writeLog('PRELOAD_STAT_ERR', 'stat shim: ' + e); }\n"
                 "const origExit = process.exit;\n"
                 "process.exit = function(code) {\n"
                 "  const st = new Error().stack;\n"
@@ -586,8 +617,8 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "    }\n"
                 "    const targetCwd = options && options.cwd ? options.cwd : (process.env.HOME || process.cwd());\n"
                 "    let effectiveCmd = fullCmd.trim();\n"
-                "    if (targetCwd && !effectiveCmd.startsWith('cd ') && !effectiveCmd.startsWith('cd/')) {\n"
-                "      effectiveCmd = `cd ${JSON.stringify(targetCwd)} && ${effectiveCmd}`;\n"
+                "    if (targetCwd && !effectiveCmd.startsWith('cd ') && !effectiveCmd.startsWith('cd/') && !effectiveCmd.startsWith('if ! cd ')) {\n"
+                "      effectiveCmd = `if ! cd ${JSON.stringify(targetCwd)} 2>/dev/null; then cd /data/local/tmp 2>/dev/null || true; fi\\n${effectiveCmd}`;\n"
                 "    }\n"
                 "    const child = new EventEmitter();\n"
                 "    const pid = Math.floor(Math.random() * 20000) + 10000;\n"
@@ -1188,10 +1219,28 @@ void DshHost::HandleToolHttpRequest(int cfd) {
         size_t b1 = body.find('{', a_pos + 7);
         if (b1 != std::string::npos) {
             int depth = 1;
+            bool in_str = false;
+            bool esc = false;
             size_t b2 = b1 + 1;
             for (; b2 < body.size() && depth > 0; b2++) {
-                if (body[b2] == '{') depth++;
-                else if (body[b2] == '}') depth--;
+                char ch = body[b2];
+                if (in_str) {
+                    if (esc) {
+                        esc = false;
+                    } else if (ch == '\\') {
+                        esc = true;
+                    } else if (ch == '"') {
+                        in_str = false;
+                    }
+                } else {
+                    if (ch == '"') {
+                        in_str = true;
+                    } else if (ch == '{') {
+                        depth++;
+                    } else if (ch == '}') {
+                        depth--;
+                    }
+                }
             }
             if (depth == 0) {
                 args_json = body.substr(b1, b2 - b1);

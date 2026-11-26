@@ -20,7 +20,7 @@ export function apply(ctx) {
         '# Mobile Host Capabilities & Web Navigation',
         '- For viewing, opening, or interacting with webpages (including login pages, search engines, articles), ALWAYS prefer the standard MCP browser tools (`mcp__swai__browser_navigate`, `mcp__swai__browser_snapshot`, `mcp__swai__browser_click`, `mcp__swai__browser_type`, `mcp__swai__browser_evaluate`). This activates the in-app browser overlay and performs resilient CDP automation.',
         '- Do NOT attempt to launch external browser apps (like com.huawei.hmos.browser) via shell commands or ui launch_app unless explicitly requested by the user.',
-        '- You have direct access to `bash` for system shell commands (runs with uid 2000), `ui` for HarmonyOS UI automation (uitest/uinput), `offline_code` for Python/JS offline evaluation, and `remote_bash` for remote server execution via SSH.'
+        '- You have direct access to `glob` and `grep` (in-process native filesystem search), `read`/`write`/`edit` for workspace files, `bash` for system shell commands (runs with uid 2000 and automatically bridges `/data/storage/` sandbox paths via debug mount), `ui` for HarmonyOS UI automation (uitest/uinput), `offline_code` for Python/JS offline evaluation, and `remote_bash` for remote server execution via SSH.'
       ].join('\n')
     });
   }
@@ -97,7 +97,9 @@ export function apply(ctx) {
     async execute(args) {
       const cwd = process.cwd();
       const rawCmd = (args.command || '').trim();
-      const cmd = (rawCmd.startsWith('cd ') || rawCmd.startsWith('cd/')) ? rawCmd : `cd ${JSON.stringify(cwd)} && ${rawCmd}`;
+      const cmd = (!cwd || rawCmd.startsWith('cd ') || rawCmd.startsWith('cd/') || rawCmd.startsWith('if ! cd '))
+        ? rawCmd
+        : `if ! cd ${JSON.stringify(cwd)} 2>/dev/null; then cd /data/local/tmp 2>/dev/null || true; fi\n${rawCmd}`;
       const payload = { ...args, command: cmd };
       const res = await dispatchSwaiTool('bash', payload, ((args.timeout || 30) + 5) * 1000);
       return { text: res.ok ? res.output : `Exit ${res.exitCode}: ${res.error || res.output}` };

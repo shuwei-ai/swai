@@ -23,6 +23,8 @@ export class AgentWorkspace {
 
   private context: common.Context | null = null;
   private workspaceRoot: string = '/data/storage/el2/base/haps/entry/files/workspace';
+  private bundleName: string = 'com.shuwei.shellbridge';
+  private userId: number = 100;
 
   static getInstance(): AgentWorkspace {
     return AgentWorkspace.instance;
@@ -36,10 +38,22 @@ export class AgentWorkspace {
     if (context && context.filesDir) {
       this.workspaceRoot = `${context.filesDir}/workspace`;
     }
+    if (context && context.applicationInfo) {
+      if (context.applicationInfo.name && context.applicationInfo.name.length > 0) {
+        this.bundleName = context.applicationInfo.name;
+      }
+      const uid = context.applicationInfo.uid;
+      if (typeof uid === 'number' && uid >= 200000) {
+        this.userId = Math.floor(uid / 200000);
+      }
+    }
     this.ensureDir(this.workspaceRoot);
+    this.ensureDir(`${this.workspaceRoot}/.tmp`);
     hilog.info(DOMAIN, TAG, 'AgentWorkspace initialized at %{public}s', this.workspaceRoot);
     // Cleanup any duplicate stray workspace/workspace dirs and rescue files
     this.cleanupDuplicateWorkspaceDirs();
+    // Cleanup any empty directories mistakenly created with file extensions by legacy stat shim
+    this.cleanupPhantomFileDirs(this.workspaceRoot, 0);
     // Proactively grant public directory permissions in background
     this.ensurePermissionsSilently();
     // Ensure CPython 3.13 standard library zip is deployed
@@ -134,11 +148,69 @@ export class AgentWorkspace {
     }
     const runtimeDir = `${this.context.filesDir}/dsh-runtime`;
     const binJs = `${runtimeDir}/node_modules/@deepseek-ai/dsh/lib/bin.js`;
+
+    let alreadyExtracted = false;
+    try {
+      alreadyExtracted = fs.accessSync(binJs);
+    } catch (_e) {
+      alreadyExtracted = false;
+    }
+
+    if (!alreadyExtracted) {
+      try {
+        const zipDest = `${this.context.filesDir}/dsh-runtime.zip`;
+        hilog.info(DOMAIN, TAG, 'Extracting dsh-runtime.zip from rawfile...');
+
+        try {
+          fs.mkdirSync(runtimeDir);
+        } catch (_m) {}
+
+        let fdObj = this.context.resourceManager.getRawFdSync('dsh-runtime.zip');
+        let out = fs.openSync(zipDest, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        let copyBuf = new ArrayBuffer(1024 * 1024);
+        let totalRead = 0;
+        let targetLen = fdObj.length;
+        while (totalRead < targetLen) {
+          let chunkLen = Math.min(copyBuf.byteLength, targetLen - totalRead);
+          let n = fs.readSync(fdObj.fd, copyBuf, { offset: fdObj.offset + totalRead, length: chunkLen });
+          if (n <= 0) break;
+          fs.writeSync(out.fd, copyBuf, { length: n });
+          totalRead += n;
+        }
+        fs.closeSync(out);
+        this.context.resourceManager.closeRawFdSync('dsh-runtime.zip');
+        hilog.info(DOMAIN, TAG, 'dsh-runtime.zip copied (%{public}d bytes), decompressing...', totalRead);
+
+        await zlib.decompressFile(zipDest, runtimeDir);
+        hilog.info(DOMAIN, TAG, 'dsh-runtime decompressed successfully to %{public}s', runtimeDir);
+        try {
+          fs.unlinkSync(zipDest);
+        } catch (_u) {}
+      } catch (err) {
+        hilog.error(DOMAIN, TAG, 'ensureDshRuntime failed: %{public}s', `${err}`);
+        return '';
+      }
+    }
+
+    this.syncAndPatchDshRuntime(runtimeDir);
+    return runtimeDir;
+  }
+
+  /**
+   * Syncs latest bridge scripts and applies all OpenHarmony/ArkWeb compatibility patches
+   * to the extracted dsh-runtime directory before embedded Node starts.
+   */
+  private syncAndPatchDshRuntime(runtimeDir: string): void {
+    if (!this.context) {
+      return;
+    }
     // Ensure bridge directory exists before writing bridge scripts
     this.ensureDir(`${runtimeDir}/bridge`);
     // Always keep bridge scripts in sync with latest rawfiles (with dual swai & piha support)
     const bridgeSyncList: [string, string][] = [
       ['dsh_bridge/bridge-client.mjs', `${runtimeDir}/bridge/bridge-client.mjs`],
+      ['dsh_bridge/swai-fs-search.mjs', `${runtimeDir}/bridge/swai-fs-search.mjs`],
+      ['dsh_bridge/swai-sharp.mjs', `${runtimeDir}/bridge/swai-sharp.mjs`],
       ['dsh_bridge/swai-tools.mjs', `${runtimeDir}/bridge/swai-tools.mjs`],
       ['dsh_bridge/swai-tools.mjs', `${runtimeDir}/bridge/piha-tools.mjs`],
       ['dsh_bridge/swai-host.patch.json', `${runtimeDir}/bridge/swai-host.patch.json`],
@@ -215,48 +287,17 @@ export class AgentWorkspace {
     // Always enforce resilience in dsh-working-directory to prevent session crash on missing directory
     this.patchDshWorkingDirectory(runtimeDir);
 
-    try {
-      if (fs.accessSync(binJs)) {
-        return runtimeDir;
-      }
-    } catch (_e) {}
+    // Always enforce in-process native fs search backend for glob/grep (replaces unavailable @vscode/ripgrep binary)
+    this.patchDshSearchTools(runtimeDir);
 
-    try {
-      const zipDest = `${this.context.filesDir}/dsh-runtime.zip`;
-      hilog.info(DOMAIN, TAG, 'Extracting dsh-runtime.zip from rawfile...');
+    // Always enforce ArkWeb non-special scheme URL parsing compatibility for dsh-resource:// previews
+    this.patchDshResourceUrlParsing(runtimeDir);
 
-      try {
-        fs.mkdirSync(runtimeDir);
-      } catch (_m) {}
+    // Always normalize /mnt/debug/.../data/storage shell mount aliases to /data/storage in dsh-fs-local
+    this.patchDshLocalFsAlias(runtimeDir);
 
-      let fdObj = this.context.resourceManager.getRawFdSync('dsh-runtime.zip');
-      let out = fs.openSync(zipDest, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      let buffer = new ArrayBuffer(1024 * 1024);
-      let totalRead = 0;
-      let targetLen = fdObj.length;
-      while (totalRead < targetLen) {
-        let chunkLen = Math.min(buffer.byteLength, targetLen - totalRead);
-        let n = fs.readSync(fdObj.fd, buffer, { offset: fdObj.offset + totalRead, length: chunkLen });
-        if (n <= 0) break;
-        fs.writeSync(out.fd, buffer, { length: n });
-        totalRead += n;
-      }
-      fs.closeSync(out);
-      this.context.resourceManager.closeRawFdSync('dsh-runtime.zip');
-      hilog.info(DOMAIN, TAG, 'dsh-runtime.zip copied (%{public}d bytes), decompressing...', totalRead);
-
-      await zlib.decompressFile(zipDest, runtimeDir);
-      hilog.info(DOMAIN, TAG, 'dsh-runtime decompressed successfully to %{public}s', runtimeDir);
-      this.patchDshIndexHtml(runtimeDir);
-      this.patchDshWorkingDirectory(runtimeDir);
-      try {
-        fs.unlinkSync(zipDest);
-      } catch (_u) {}
-      return runtimeDir;
-    } catch (err) {
-      hilog.error(DOMAIN, TAG, 'ensureDshRuntime failed: %{public}s', `${err}`);
-      return '';
-    }
+    // Always enforce HarmonyOS native image processor bridge for dsh-attachment-local (replaces sharp/libvips)
+    this.patchDshAttachmentLocal(runtimeDir);
   }
 
   /**
@@ -395,6 +436,230 @@ export class AgentWorkspace {
   }
 
   /**
+   * Patches @deepseek-ai/dsh-tool-fs-search/lib/index.js so `glob` and `grep` execute
+   * directly in-process via Node `fs` + `picomatch` (`bridge/swai-fs-search.mjs`) instead
+   * of failing with `ripgrep launch failed` on HarmonyOS NEXT.
+   */
+  private patchDshSearchTools(runtimeDir: string): void {
+    try {
+      const searchJsPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-tool-fs-search/lib/index.js`;
+      if (fs.accessSync(searchJsPath)) {
+        let curContent = fs.readTextSync(searchJsPath);
+        if (!curContent.includes('SWAI_NATIVE_FS_SEARCH')) {
+          const targetFn = 'async function runRipgrep(ctx, exec, toolName, argv, rawOutputMaxBytes, graceMs, stderrMaxBytes) {';
+          if (curContent.includes(targetFn)) {
+            const importStmt = 'import { runSwaiFsSearch as __swaiRunFsSearch } from "../../../../bridge/swai-fs-search.mjs";\n';
+            curContent = importStmt + curContent.replace(
+              targetFn,
+              `${targetFn} /* SWAI_NATIVE_FS_SEARCH */ return await __swaiRunFsSearch(ctx, exec, toolName, argv, rawOutputMaxBytes, SearchError);`
+            );
+            const file = fs.openSync(searchJsPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced SWAI_NATIVE_FS_SEARCH at %{public}s', searchJsPath);
+          }
+        }
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'Failed to patch dsh-tool-fs-search: %{public}s', `${e}`);
+    }
+  }
+
+  /**
+   * Patches DSH client bundles so `dsh-resource://<protocol>/...` URLs parse identically on
+   * HarmonyOS NEXT ArkWeb (where pre-WHATWG non-special URL parsing leaves `hostname === ""`
+   * and puts `"//<protocol>/..."` into `pathname`), fixing "文件资源服务不可用" in document preview.
+   */
+  private patchDshResourceUrlParsing(runtimeDir: string): void {
+    // 1. @deepseek-ai/dsh-client-resources/lib/client.js (`protocolOf`)
+    try {
+      const resClientPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-client-resources/lib/client.js`;
+      if (fs.accessSync(resClientPath)) {
+        let curContent = fs.readTextSync(resClientPath);
+        if (!curContent.includes('SWAI_RESOURCE_URL_FIX')) {
+          const target = 'return parsed.hostname === "" ? void 0 : parsed.hostname.toLowerCase();';
+          const replacement = '/* SWAI_RESOURCE_URL_FIX */ if (parsed.hostname !== "") return parsed.hostname.toLowerCase(); const _swaiProto = /^\\/\\/([^/?#]+)(?:[/?#]|$)/.exec(parsed.pathname); return _swaiProto ? _swaiProto[1].toLowerCase() : void 0;';
+          if (curContent.includes(target)) {
+            curContent = curContent.replace(target, replacement);
+            const file = fs.openSync(resClientPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced SWAI_RESOURCE_URL_FIX at %{public}s', resClientPath);
+          }
+        }
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'Failed to patch dsh-client-resources: %{public}s', `${e}`);
+    }
+
+    // 2. @deepseek-ai/dsh-client-ui-sidebar-right/lib/client.js (`pathOf`)
+    try {
+      const sidebarClientPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-client-ui-sidebar-right/lib/client.js`;
+      if (fs.accessSync(sidebarClientPath)) {
+        let curContent = fs.readTextSync(sidebarClientPath);
+        if (!curContent.includes('SWAI_SIDEBAR_URL_FIX')) {
+          const target = 'function pathOf(address) {\n\t\t\ttry {\n\t\t\t\treturn new URL(address).pathname;';
+          const replacement = 'function pathOf(address) {\n\t\t\t/* SWAI_SIDEBAR_URL_FIX */\n\t\t\ttry {\n\t\t\t\tconst _u = new URL(address);\n\t\t\t\tif (_u.hostname === "" && _u.pathname.startsWith("//") && !_u.pathname.startsWith("///")) return _u.pathname.replace(/^\\/\\/[^/]*/, "");\n\t\t\t\treturn _u.pathname;';
+          if (curContent.includes(target)) {
+            curContent = curContent.replace(target, replacement);
+            const file = fs.openSync(sidebarClientPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced SWAI_SIDEBAR_URL_FIX at %{public}s', sidebarClientPath);
+          }
+        }
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'Failed to patch dsh-client-ui-sidebar-right: %{public}s', `${e}`);
+    }
+
+    // 3. @deepseek-ai/dsh-client-ui-subagent/lib/client.js (`parseSubagentChatAddress`)
+    try {
+      const subagentClientPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-client-ui-subagent/lib/client.js`;
+      if (fs.accessSync(subagentClientPath)) {
+        let curContent = fs.readTextSync(subagentClientPath);
+        if (!curContent.includes('SWAI_SUBAGENT_URL_FIX')) {
+          const target = 'if (url.protocol !== "dsh-resource:" || url.hostname.toLowerCase() !== "subagentchat") return void 0;\n\t\t\tconst parts = url.pathname.split("/").filter(Boolean);';
+          const replacement = '/* SWAI_SUBAGENT_URL_FIX */ const _swaiHost = url.hostname !== "" ? url.hostname : (/^\\/\\/([^/?#]+)/.exec(url.pathname)?.[1] ?? ""); const _swaiPath = url.hostname !== "" ? url.pathname : url.pathname.replace(/^\\/\\/[^/]*/, "");\n\t\t\tif (url.protocol !== "dsh-resource:" || _swaiHost.toLowerCase() !== "subagentchat") return void 0;\n\t\t\tconst parts = _swaiPath.split("/").filter(Boolean);';
+          if (curContent.includes(target)) {
+            curContent = curContent.replace(target, replacement);
+            const file = fs.openSync(subagentClientPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced SWAI_SUBAGENT_URL_FIX at %{public}s', subagentClientPath);
+          }
+        }
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'Failed to patch dsh-client-ui-subagent: %{public}s', `${e}`);
+    }
+  }
+
+  /**
+   * Patches @deepseek-ai/dsh-fs-local/lib/index.js so:
+   * 1) `/mnt/debug/<userId>/debug_hap/<bundle>/data/storage` paths emitted by uid=2000 shell commands
+   *    resolve seamlessly to `/data/storage` inside the app sandbox;
+   * 2) `/tmp` and `/tmp/...` paths resolve to the writable sandbox temp directory (`TMPDIR` / `workspace/.tmp`)
+   *    instead of failing on HarmonyOS NEXT's read-only `/` rootfs.
+   */
+  private patchDshLocalFsAlias(runtimeDir: string): void {
+    try {
+      const fsLocalPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-fs-local/lib/index.js`;
+      if (fs.accessSync(fsLocalPath)) {
+        let curContent = fs.readTextSync(fsLocalPath);
+        if (!curContent.includes('SWAI_SANDBOX_ALIAS_FIX_V2')) {
+          const helperDecl = '/* SWAI_SANDBOX_ALIAS_FIX_V2 */ function __swaiNormFsPath(p) { if (typeof p !== "string") return p; p = p.replace(/^\\/mnt\\/debug\\/\\d+\\/debug_hap\\/[^/]+\\/data\\/storage(?=\\/|$)/, "/data/storage"); if (p === "/tmp" || p.startsWith("/tmp/")) { const _td = (process.env.TMPDIR && process.env.TMPDIR !== "/tmp") ? process.env.TMPDIR.replace(/\\/+$/, "") : "/data/storage/el2/base/haps/entry/files/workspace/.tmp"; p = _td + p.slice(4); } return p; }\n';
+          const targetExpand = 'function expandHomePrefix(path) {';
+          const replacementExpand = helperDecl + 'function expandHomePrefix(path) { path = __swaiNormFsPath(path);';
+          const targetDisplay = 'function localDisplayPath(cwd, path) {';
+          const replacementDisplay = 'function localDisplayPath(cwd, path) { cwd = __swaiNormFsPath(cwd); path = __swaiNormFsPath(path);';
+          const targetHost = 'processPathFromHostPath(hostPath) {';
+          const replacementHost = 'processPathFromHostPath(hostPath) { hostPath = __swaiNormFsPath(hostPath);';
+          if (curContent.includes(targetExpand) && curContent.includes(targetDisplay)) {
+            curContent = curContent.replace(targetExpand, replacementExpand);
+            curContent = curContent.replace(targetDisplay, replacementDisplay);
+            if (curContent.includes(targetHost)) {
+              curContent = curContent.replace(targetHost, replacementHost);
+            }
+            const file = fs.openSync(fsLocalPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            fs.writeSync(file.fd, curContent);
+            fs.closeSync(file);
+            hilog.info(DOMAIN, TAG, 'Enforced SWAI_SANDBOX_ALIAS_FIX_V2 at %{public}s', fsLocalPath);
+          }
+        }
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'Failed to patch dsh-fs-local: %{public}s', `${e}`);
+    }
+  }
+
+  /**
+   * Patches @deepseek-ai/dsh-attachment-local/lib/index.js so:
+   * 1) `requireSharp` resolves to `bridge/swai-sharp.mjs` (backed by HarmonyOS @ohos.multimedia.image)
+   *    instead of missing native `sharp` / disabled `--jitless` WebAssembly;
+   * 2) `syncDirectory` safely tolerates sandbox EACCES/EPERM/EINVAL/EBADF when `ensureDurableHome`
+   *    walks ancestor directories above `/data/storage/el2/base/haps/entry/files`.
+   */
+  private patchDshAttachmentLocal(runtimeDir: string): void {
+    try {
+      const attachLocalPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js`;
+      if (fs.accessSync(attachLocalPath)) {
+        let curContent = fs.readTextSync(attachLocalPath);
+        let modified = false;
+
+        if (!curContent.includes('SWAI_SHARP_BRIDGE_V1')) {
+          const targetRequire = 'const requireSharp = createLazyRequire("sharp", import.meta.url);';
+          if (curContent.includes(targetRequire)) {
+            const importStmt = 'import { swaiSharp as __swaiSharp } from "../../../../bridge/swai-sharp.mjs";\n';
+            curContent = importStmt + curContent.replace(
+              targetRequire,
+              '/* SWAI_SHARP_BRIDGE_V1 */ const requireSharp = () => __swaiSharp;'
+            );
+            modified = true;
+          }
+        }
+
+        if (!curContent.includes('SWAI_SYNC_DIR_SAFE')) {
+          const targetSync = 'async function syncDirectory(path) {\n\t/* v8 ignore next -- Windows cannot open directory handles; NTFS metadata journaling owns entry durability there. */\n\tif (process.platform === "win32") return;\n\t/* v8 ignore start -- Windows cannot exercise directory fsync; POSIX behavior tests enforce this peer. */\n\tconst handle = await open(path, constants.O_RDONLY);\n\ttry {\n\t\tawait handle.sync();\n\t} finally {\n\t\tawait handle.close();\n\t}\n\t/* v8 ignore stop */\n}';
+          const replacementSync = 'async function syncDirectory(path) {\n\t/* SWAI_SYNC_DIR_SAFE */\n\tif (process.platform === "win32") return;\n\tlet handle;\n\ttry {\n\t\thandle = await open(path, constants.O_RDONLY);\n\t\tawait handle.sync();\n\t} catch (_swaiSyncErr) {\n\t\treturn;\n\t} finally {\n\t\tif (handle !== void 0) await handle.close().catch(() => {});\n\t}\n}';
+          if (curContent.includes(targetSync)) {
+            curContent = curContent.replace(targetSync, replacementSync);
+            modified = true;
+          }
+        }
+
+        if (modified) {
+          const file = fs.openSync(attachLocalPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+          fs.writeSync(file.fd, curContent);
+          fs.closeSync(file);
+          hilog.info(DOMAIN, TAG, 'Enforced SWAI_SHARP_BRIDGE_V1 at %{public}s', attachLocalPath);
+        }
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'Failed to patch dsh-attachment-local: %{public}s', `${e}`);
+    }
+  }
+
+  /**
+   * Removes empty directories whose names carry regular file extensions (e.g. `foo.md`)
+   * that were accidentally created by the legacy preload `fsp.stat` `mkdirSync` shim.
+   * Only completely empty directories (`listFileSync().length === 0`) are ever removed.
+   */
+  private cleanupPhantomFileDirs(dirPath: string, depth: number): void {
+    if (depth > 2) {
+      return;
+    }
+    const fileExtPattern = /^.+\.(md|txt|json|json5|yaml|yml|js|mjs|cjs|ts|ets|py|sh|html|css|csv|xml|svg|png|jpg|jpeg|webp|pdf|log)$/i;
+    try {
+      const entries = fs.listFileSync(dirPath);
+      for (let i = 0; i < entries.length; i++) {
+        const name = entries[i];
+        if (!name || name.startsWith('.') || name.endsWith('.tmpdir')) {
+          continue;
+        }
+        const fullPath = `${dirPath}/${name}`;
+        try {
+          const st = fs.statSync(fullPath);
+          if (!st.isDirectory()) {
+            continue;
+          }
+          const children = fs.listFileSync(fullPath);
+          if (children.length === 0 && fileExtPattern.test(name)) {
+            fs.rmdirSync(fullPath);
+            hilog.info(DOMAIN, TAG, 'Removed phantom empty file-named directory: %{public}s', fullPath);
+          } else if (children.length > 0 && !fileExtPattern.test(name) && name !== 'workspace' && name !== 'workspace ') {
+            this.cleanupPhantomFileDirs(fullPath, depth + 1);
+          }
+        } catch (_entryErr) {
+          // ignore inaccessible or symlink entry
+        }
+      }
+    } catch (_dirErr) {
+      // ignore
+    }
+  }
+
+  /**
    * Auto-grants public directory access permissions via shell bridge if token ID is known.
    * - ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY
    * - ohos.permission.READ_WRITE_DOCUMENTS_DIRECTORY
@@ -419,6 +684,39 @@ export class AgentWorkspace {
     return this.workspaceRoot;
   }
 
+  getBundleName(): string {
+    return this.bundleName;
+  }
+
+  getUserId(): number {
+    return this.userId;
+  }
+
+  getDebugSandboxRoot(bundleName?: string): string {
+    const target = (bundleName && bundleName.trim().length > 0) ? bundleName.trim() : this.bundleName;
+    return `/mnt/debug/${this.userId}/debug_hap/${target}`;
+  }
+
+  /**
+   * Converts `/mnt/debug/<userId>/debug_hap/<ownBundle>/data/storage/...` paths back to
+   * canonical `/data/storage/...` paths for in-process file APIs.
+   */
+  normalizeDebugMountPath(rawPath: string): string {
+    if (!rawPath || rawPath.length === 0) {
+      return rawPath;
+    }
+    const trimmed = rawPath.trim();
+    const ownPrefix = `/mnt/debug/${this.userId}/debug_hap/${this.bundleName}/data/storage`;
+    if (trimmed === ownPrefix || trimmed.startsWith(`${ownPrefix}/`)) {
+      return `/data/storage${trimmed.substring(ownPrefix.length)}`;
+    }
+    const genericMatch = /^\/mnt\/debug\/\d+\/debug_hap\/([^/]+)(\/data\/storage(?:\/.*)?)$/.exec(trimmed);
+    if (genericMatch && genericMatch[1] === this.bundleName) {
+      return genericMatch[2];
+    }
+    return trimmed;
+  }
+
   setWorkspaceRoot(root: string): void {
     if (root && root.trim().length > 0) {
       this.workspaceRoot = this.normalizePath(root.trim());
@@ -434,7 +732,7 @@ export class AgentWorkspace {
     if (!rawPath || rawPath.trim().length === 0) {
       return false;
     }
-    const trimmed = rawPath.trim();
+    const trimmed = this.normalizeDebugMountPath(rawPath.trim());
 
     // Public system storage directories (Download/Docs/Desktop via @ohos.file.environment)
     if (this.isPublicPath(trimmed)) {
@@ -668,7 +966,7 @@ export class AgentWorkspace {
    * Resolves relative paths into absolute workspace paths and normalizes directory segments.
    */
   resolvePath(rawPath: string): string {
-    let trimmed = rawPath.trim();
+    let trimmed = this.normalizeDebugMountPath(rawPath.trim());
     if (this.isPublicPath(trimmed)) {
       return this.resolvePublicPath(trimmed);
     }

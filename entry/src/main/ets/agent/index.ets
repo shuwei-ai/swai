@@ -41,5 +41,6 @@ export * from './harness/OutputTruncator';
 export * from './env/EnvironmentSnapshot';
 export * from './dsh/DshAgentManager';
 export * from './dsh/DshToolBridge';
+export * from './dsh/DshImageProcessor';
 export * from './dsh/DshClient';
 export * from './dsh/DshAgentSession';

@@ -126,5 +126,11 @@ execSync(`npx --yes esbuild "${tempEntry}" --bundle --platform=node --format=esm
   stdio: 'inherit'
 });
 
+// Strip eager undici/llhttp WebAssembly initialization so bundle runs cleanly under Node `--jitless` on HarmonyOS NEXT
+let bundled = fs.readFileSync(outPath, 'utf-8');
+bundled = bundled.replace('var undici = __importStar(require_undici());', 'var undici = {};');
+bundled = bundled.replace('var llhttpPromise = lazyllhttp();\n      llhttpPromise.catch();', 'var llhttpPromise = null;');
+fs.writeFileSync(outPath, bundled, 'utf-8');
+
 fs.unlinkSync(tempEntry);
 console.log('Successfully bundled wechat-formatter.mjs to:', outPath);

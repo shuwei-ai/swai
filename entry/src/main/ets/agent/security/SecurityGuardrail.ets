@@ -37,7 +37,7 @@ export class SecurityGuardrail {
    */
   private static readonly CRITICAL_PATTERNS: GuardrailPatternItem[] = [
     new GuardrailPatternItem(
-      /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*)\s+(\/|\/\*|\/system|\/data|\/data\/storage|\/data\/app|\/vendor)(\s|$)/i,
+      /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*)\s+(\/|\/\*|\/system|\/data|\/data\/storage|\/data\/app|\/mnt\/debug|\/vendor)(\s|$)/i,
       'Attempted catastrophic recursive deletion of root or critical system/data partitions'
     ),
     new GuardrailPatternItem(

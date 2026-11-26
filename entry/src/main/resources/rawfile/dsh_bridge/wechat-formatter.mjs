@@ -27448,8 +27448,7 @@ Content-Type: ${value2.type || "application/octet-stream"}\r
         });
       }
       var llhttpInstance = null;
-      var llhttpPromise = lazyllhttp();
-      llhttpPromise.catch();
+      var llhttpPromise = null;
       var currentParser = null;
       var currentBufferRef = null;
       var currentBufferSize = 0;
@@ -39593,7 +39592,7 @@ ${value2}`;
       var htmlparser2 = __importStar(require_lib6());
       var parse5_parser_stream_1 = require_cjs3();
       var encoding_sniffer_1 = require_commonjs2();
-      var undici = __importStar(require_undici());
+      var undici = {};
       var whatwg_mimetype_1 = __importDefault(require_mime_type());
       var node_stream_1 = __require("node:stream");
       var options_js_1 = require_options();
