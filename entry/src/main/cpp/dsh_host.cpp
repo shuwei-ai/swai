@@ -203,6 +203,12 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
     current_options_ = options;
     stop_requested_.store(false);
 
+    // Clear any stale ready.json from a previous process before starting StatusWatcherThread
+    if (!options.workspace_root.empty()) {
+        std::string stale_ready = options.workspace_root + "/ready.json";
+        unlink(stale_ready.c_str());
+    }
+
     DshState::GetInstance().SetStarting();
     is_running_.store(true);
 
@@ -279,7 +285,7 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
             setenv("TMP", tmp_dir.c_str(), 1);
             setenv("TEMP", tmp_dir.c_str(), 1);
 
-            // Write $DSH_HOME/cordis.patch.yml so DSH automatically loads Swai tools/mcp
+            // Write $DSH_HOME/cordis.patch.yml so DSH loads Swai tools directly and disables desktop-only plugins
             std::string home_patch_yml = dsh_dir + "/cordis.patch.yml";
             std::string tools_mjs = options.runtime_root + "/bridge/swai-tools.mjs";
             FILE* hpf = fopen(home_patch_yml.c_str(), "w");
@@ -288,15 +294,59 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                     "- insert:\n"
                     "    - id: swai-tools\n"
                     "      name: \"%s\"\n"
-                    "    - id: swai-mcp\n"
-                    "      name: \"@deepseek-ai/dsh-mcp-client\"\n"
-                    "      config:\n"
-                    "        transport: \"streamable-http\"\n"
-                    "        serverName: \"swai\"\n"
-                    "        url: \"http://127.0.0.1:39001/mcp\"\n",
+                    "- id: otel\n"
+                    "  disabled: true\n"
+                    "- id: session-telemetry-otel\n"
+                    "  disabled: true\n"
+                    "- id: desktop-product-telemetry\n"
+                    "  disabled: true\n"
+                    "- id: product-analytics\n"
+                    "  disabled: true\n"
+                    "- id: hmr\n"
+                    "  disabled: true\n"
+                    "- id: client-hmr\n"
+                    "  disabled: true\n"
+                    "- id: office-kit\n"
+                    "  disabled: true\n"
+                    "- id: skill-office\n"
+                    "  disabled: true\n"
+                    "- id: action-cards\n"
+                    "  disabled: true\n"
+                    "- id: client-ui-action-cards\n"
+                    "  disabled: true\n"
+                    "- id: creation-recommendations\n"
+                    "  disabled: true\n"
+                    "- id: client-ui-creation-recommendations\n"
+                    "  disabled: true\n"
+                    "- id: plugin-recommendations\n"
+                    "  disabled: true\n"
+                    "- id: client-ui-plugin-recommendations\n"
+                    "  disabled: true\n"
+                    "- id: open-in-app\n"
+                    "  disabled: true\n"
+                    "- id: ui-open-in-app\n"
+                    "  disabled: true\n"
+                    "- id: pwsh-sandbox\n"
+                    "  disabled: true\n"
+                    "- id: tool-pwsh\n"
+                    "  disabled: true\n"
+                    "- id: plugin-inventory\n"
+                    "  disabled: true\n"
+                    "- id: plugin-package-inventory-deepseek\n"
+                    "  disabled: true\n"
+                    "- id: message-feedback\n"
+                    "  disabled: true\n"
+                    "- id: ui-message-feedback\n"
+                    "  disabled: true\n",
                     tools_mjs.c_str());
                 fclose(hpf);
             }
+        }
+        if (!options.runtime_root.empty()) {
+            std::string compile_cache_dir = options.runtime_root + "/.compile-cache";
+            mkdir(compile_cache_dir.c_str(), 0777);
+            chmod(compile_cache_dir.c_str(), 0777);
+            setenv("NODE_COMPILE_CACHE", compile_cache_dir.c_str(), 1);
         }
         std::string node_modules = options.runtime_root + "/node_modules";
         setenv("NODE_PATH", node_modules.c_str(), 1);
@@ -369,9 +419,13 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "    let wrapped = crashListenerMap.get(fn);\n"
                 "    if (!wrapped) {\n"
                 "      wrapped = function(...cargs) {\n"
+                "        const reason = cargs[0];\n"
+                "        const detail = reason && reason.stack ? reason.stack : String(reason);\n"
+                "        if (ev === 'unhandledRejection' && detail.includes('WebAssembly is disabled in --jitless mode')) {\n"
+                "          writeLog('ISOLATED_JITLESS_WASM_ERR', `Ignored expected --jitless WebAssembly rejection: ${detail}`);\n"
+                "          return;\n"
+                "        }\n"
                 "        if (dshServerReady) {\n"
-                "          const reason = cargs[0];\n"
-                "          const detail = reason && reason.stack ? reason.stack : String(reason);\n"
                 "          writeLog('ISOLATED_RUNTIME_ERR', `Prevented ${ev} from tearing down live DSH server: ${detail}`);\n"
                 "          return;\n"
                 "        }\n"
@@ -753,16 +807,6 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "    return true;\n"
                 "  };\n"
                 "} catch(e) { writeLog('PRELOAD_CP_ERR', 'child_process shim: ' + e); }\n"
-                "try {\n"
-                "  process.env.SWAI_AUTO_START_MCP = '1';\n"
-                "  process.env.PIHA_AUTO_START_MCP = '1';\n"
-                "  const mcpPath = '" + options.runtime_root + "/bridge/swai-mcp-server.mjs';\n"
-                "  import(mcpPath).then(() => {\n"
-                "    writeLog('PRELOAD_MCP', 'Swai MCP server started on 39001');\n"
-                "  }).catch(e => {\n"
-                "    writeLog('PRELOAD_MCP_ERR', 'Failed to start Swai MCP server: ' + e);\n"
-                "  });\n"
-                "} catch(e) { writeLog('PRELOAD_MCP_EX', 'Swai MCP exception: ' + e); }\n"
                 "try {\n"
                 "  const https = require('https');\n"
                 "  const http = require('http');\n"
@@ -1157,8 +1201,8 @@ void DshHost::StatusWatcherThread() {
     std::string ready_file = current_options_.workspace_root + "/ready.json";
 
     while (!stop_requested_.load()) {
-        // Check if ready.json was created by preload script
-        if (DshState::GetInstance().GetSnapshot().phase != "running") {
+        bool is_running = (DshState::GetInstance().GetSnapshot().phase == "running");
+        if (!is_running) {
             FILE* rfp = fopen(ready_file.c_str(), "r");
             if (rfp) {
                 char rbuf[512];
@@ -1179,12 +1223,13 @@ void DshHost::StatusWatcherThread() {
                         if (port > 0 && !token.empty()) {
                             DshState::GetInstance().SetReady(port, base_url, token);
                             NotifyEvent("ready", content);
+                            is_running = true;
                         }
                     }
                 }
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(is_running ? 1000 : 50));
     }
 }
 

@@ -48,6 +48,8 @@ export class DshAgentManager {
   private activeLlmClient: LlmClient | null = null;
   private conversationHistory: Message[] = [];
   private workspaceRoot: string = '';
+  private startEnginePromise: Promise<boolean> | null = null;
+  private engineStartEpochMs: number = 0;
   private currentState: DshUiState = {
     phase: 'idle',
     isConnected: false,
@@ -84,8 +86,8 @@ export class DshAgentManager {
 
   getAuthenticatedUrl(workspaceRoot?: string): string {
     const state = this.getState();
-    if (state.baseUrl && state.authToken && state.port !== 2026) {
-      return `${state.baseUrl}/?token=${state.authToken}`;
+    if (state.baseUrl && state.port > 0) {
+      return `${state.baseUrl}/`;
     }
     // Fallback: Check ready.json on disk directly
     try {
@@ -101,11 +103,11 @@ export class DshAgentManager {
           const content = fs.readTextSync(p);
           const obj = JSON.parse(content) as Record<string, Object>;
           if (obj) {
+            if (typeof obj.baseUrl === 'string' && (obj.baseUrl as string).length > 0) {
+              return `${obj.baseUrl as string}/`;
+            }
             if (typeof obj.url === 'string' && (obj.url as string).length > 0) {
               return obj.url as string;
-            }
-            if (typeof obj.baseUrl === 'string' && typeof obj.token === 'string') {
-              return `${obj.baseUrl}/?token=${obj.token}`;
             }
           }
         }
@@ -113,7 +115,7 @@ export class DshAgentManager {
     } catch (e) {
       // ignore
     }
-    return state.baseUrl || 'http://127.0.0.1:38927';
+    return state.baseUrl || '';
   }
 
   constructor() {
@@ -254,8 +256,33 @@ export class DshAgentManager {
   }
 
   async startEngine(runtimeRoot: string, workspaceRoot: string): Promise<boolean> {
+    if (this.isEngineRunning()) {
+      return true;
+    }
+    if (this.startEnginePromise) {
+      return this.startEnginePromise;
+    }
+    this.startEnginePromise = this.startEngineInner(runtimeRoot, workspaceRoot);
+    try {
+      return await this.startEnginePromise;
+    } finally {
+      if (!this.isEngineRunning()) {
+        this.startEnginePromise = null;
+      }
+    }
+  }
+
+  private async startEngineInner(runtimeRoot: string, workspaceRoot: string): Promise<boolean> {
     this.workspaceRoot = workspaceRoot;
-    this.updateState({ phase: 'starting', lastError: undefined });
+    this.engineStartEpochMs = Date.now();
+    this.updateState({
+      phase: 'starting',
+      isConnected: false,
+      port: 0,
+      baseUrl: '',
+      authToken: undefined,
+      lastError: undefined
+    });
 
     try {
       dshHostStartNative({
@@ -269,15 +296,16 @@ export class DshAgentManager {
     // Start background Tool Bridge
     DshToolBridge.getInstance().start();
 
-    // Poll until running or timeout (15s)
-    let startTime = Date.now();
+    // Poll until running or timeout (60s for first-launch compile cache generation)
+    const startTime = this.engineStartEpochMs;
     let isRunning = false;
     let finalUrl = '';
     let finalPort = 0;
     let finalToken = '';
+    let lastErrorMsg = '';
 
-    while (Date.now() - startTime < 15000) {
-      let snap = dshHostGetSnapshotNative();
+    while (Date.now() - startTime < 60000) {
+      const snap = dshHostGetSnapshotNative();
       if (snap.phase === 'running' && snap.port > 0) {
         isRunning = true;
         finalPort = snap.port;
@@ -286,13 +314,16 @@ export class DshAgentManager {
         break;
       }
       if (snap.phase === 'error' || snap.phase === 'exited') {
-        hilog.error(DOMAIN, TAG, 'DSH engine failed to start: %{public}s - %{public}s', snap.errorCode, snap.errorMessage);
+        const errParts = [snap.errorCode, snap.errorMessage].filter((s) => s && s.trim().length > 0);
+        lastErrorMsg = errParts.length > 0 ? errParts.join(': ') : `DSH 进程异常退出 (${snap.phase})`;
+        hilog.error(DOMAIN, TAG, 'DSH engine failed to start: %{public}s', lastErrorMsg);
         break;
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
     }
 
     if (isRunning) {
+      const elapsedMs = Date.now() - this.engineStartEpochMs;
       this.updateState({
         phase: 'running',
         isConnected: true,
@@ -300,23 +331,24 @@ export class DshAgentManager {
         baseUrl: finalUrl,
         authToken: finalToken
       });
-      hilog.info(DOMAIN, TAG, 'In-process DeepSeek Harness engine running on %{public}s (token=%{public}s)', finalUrl, finalToken);
+      hilog.info(DOMAIN, TAG, 'In-process DeepSeek Harness engine ready in %{public}d ms on %{public}s', elapsedMs, finalUrl);
       return true;
     } else {
-      // Fallback
-      const enginePort = 2026;
+      const errDetail = lastErrorMsg.length > 0 ? lastErrorMsg : 'DSH engine start timed out (60s)';
       this.updateState({
-        phase: 'running',
-        isConnected: true,
-        port: enginePort,
-        baseUrl: `http://127.0.0.1:${enginePort}`
+        phase: 'error',
+        isConnected: false,
+        port: 0,
+        baseUrl: '',
+        lastError: errDetail
       });
-      hilog.warn(DOMAIN, TAG, 'Engine start poll timed out or running in simulation, port=%{public}d', enginePort);
+      hilog.error(DOMAIN, TAG, 'Engine start failed: %{public}s', errDetail);
       return false;
     }
   }
 
   stopEngine(): void {
+    this.startEnginePromise = null;
     if (this.activeLlmClient) {
       this.activeLlmClient.abort();
       this.activeLlmClient = null;

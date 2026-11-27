@@ -13,7 +13,6 @@ import photoAccessHelper from '@ohos.file.photoAccessHelper';
 import fs from '@ohos.file.fs';
 import util from '@ohos.util';
 import webview from '@ohos.web.webview';
-import http from '@ohos.net.http';
 
 import { BridgeController } from '../common/BridgeController';
 import {
@@ -158,6 +157,7 @@ struct Index {
   @State private dshLoadingStatusText: string = 'DeepSeek Harness 正在启动...';
   @State private dshLoadingDetailText: string = 'Node.js 运行时与手机宿主环境正在初始化...';
   private isAutoLoadingDsh: boolean = false;
+  private appStartMs: number = Date.now();
   @State private isBrowserOverlayVisible: boolean = false;
   private removeOverlayListener?: () => void = undefined;
 
@@ -293,57 +293,42 @@ struct Index {
     }
   }
 
-  private async testDshHttpHealth(url: string): Promise<boolean> {
-    try {
-      const httpRequest = http.createHttp();
-      const response = await httpRequest.request(url, {
-        method: http.RequestMethod.GET,
-        connectTimeout: 1200,
-        readTimeout: 1200
-      });
-      httpRequest.destroy();
-      return response && (response.responseCode === 200 || response.responseCode === 302 || response.responseCode === 304);
-    } catch (_err) {
-      return false;
-    }
-  }
-
   private async startDshAutoLoader(): Promise<void> {
     if (this.isAutoLoadingDsh || this.isDshReady) {
       return;
     }
     this.isAutoLoadingDsh = true;
 
-    // Loop until server is healthy or timeout (30s)
+    // Loop until server is ready or timeout (65s)
     const startTime = Date.now();
-    while (Date.now() - startTime < 30000 && !this.isDshReady) {
+    while (Date.now() - startTime < 65000 && !this.isDshReady) {
       const state = DshAgentManager.getInstance().getState();
       const authUrl = DshAgentManager.getInstance().getAuthenticatedUrl();
 
-      if (state.phase === 'running' && state.port > 0 && authUrl && authUrl.length > 0 && !authUrl.includes(':2026')) {
-        this.dshLoadingStatusText = '服务已启动，正在连接...';
-        this.dshLoadingDetailText = `正在测试服务响应 (端口: ${state.port})`;
-
-        const isHealthy = await this.testDshHttpHealth(authUrl);
-        if (isHealthy) {
-          hilog.info(0x3F00, 'Index', 'DSH HTTP server ready, loading into Webview: %{public}s', authUrl);
-          this.dshUrl = authUrl;
-          this.dshLoadingStatusText = '正在加载界面...';
-          this.dshLoadingDetailText = '正在渲染 Swai 交互界面，马上就好';
-          try {
-            this.dshWebviewController.loadUrl(authUrl);
-          } catch (e) {
-            // ignore
-          }
-          this.isAutoLoadingDsh = false;
-          return;
+      if (state.phase === 'running' && state.port > 0 && authUrl && authUrl.length > 0) {
+        const elapsedMs = Date.now() - this.appStartMs;
+        hilog.info(0x3F00, 'Index', 'DSH HTTP server ready in %{public}d ms, loading into Webview: %{public}s', elapsedMs, authUrl);
+        this.dshUrl = authUrl;
+        this.dshLoadingStatusText = '正在加载界面...';
+        this.dshLoadingDetailText = '正在渲染 Swai 交互界面，马上就好';
+        try {
+          this.dshWebviewController.loadUrl(authUrl);
+        } catch (e) {
+          // ignore
         }
+        this.isAutoLoadingDsh = false;
+        return;
+      } else if (state.phase === 'error') {
+        this.dshLoadingStatusText = 'DSH 启动遇到错误';
+        this.dshLoadingDetailText = state.lastError || '请点击重试加载';
+        this.isAutoLoadingDsh = false;
+        return;
       } else {
         this.dshLoadingStatusText = 'DeepSeek Harness 正在启动...';
         this.dshLoadingDetailText = 'Node.js 运行时与手机宿主环境正在初始化...';
       }
 
-      await new Promise<void>((resolve) => setTimeout(resolve, 600));
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
     }
 
     this.isAutoLoadingDsh = false;
@@ -4063,6 +4048,7 @@ struct Index {
               this.isDshLoading = false;
               if (this.dshUrl && this.dshUrl.length > 0 && !this.dshUrl.includes('about:blank')) {
                 this.isDshReady = true;
+                hilog.info(0x3F00, 'Index', 'DSH main UI ready in %{public}d ms', Date.now() - this.appStartMs);
               }
             })
             .onErrorReceive(() => {
@@ -4070,7 +4056,7 @@ struct Index {
               this.isDshReady = false;
               setTimeout(() => {
                 this.startDshAutoLoader();
-              }, 1200);
+              }, 300);
             })
 
           // DSH Loading Card (when not ready) - Full screen overlay with soft background to prevent white screen

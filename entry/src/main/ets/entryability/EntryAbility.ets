@@ -6,6 +6,7 @@ import hilog from '@ohos.hilog';
 import { BridgeController } from '../common/BridgeController';
 import { FloatWindowManager } from '../window/FloatWindowManager';
 import { AgentWorkspace } from '../agent/tools/AgentWorkspace';
+import { DshAgentManager } from '../agent/dsh/DshAgentManager';
 
 const TAG: string = 'SwShell';
 const DOMAIN: number = 0x3201;
@@ -17,6 +18,15 @@ export default class EntryAbility extends UIAbility {
     BridgeController.getInstance().init(this.context);
     FloatWindowManager.getInstance().init(this.context);
     AgentWorkspace.getInstance().init(this.context);
+
+    // Pre-warm DSH runtime and embedded Node engine immediately in parallel with window creation
+    const filesDir = this.context.filesDir;
+    AgentWorkspace.getInstance().ensureDshRuntime().then((runtimeDir: string) => {
+      const rt = runtimeDir && runtimeDir.length > 0 ? runtimeDir : filesDir;
+      DshAgentManager.getInstance().startEngine(rt, filesDir + '/workspace');
+    }).catch((_e: Object) => {
+      DshAgentManager.getInstance().startEngine(filesDir, filesDir + '/workspace');
+    });
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {

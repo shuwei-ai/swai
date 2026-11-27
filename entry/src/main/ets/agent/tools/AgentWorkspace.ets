@@ -18,6 +18,7 @@ import { BridgeController } from '../../common/BridgeController';
 const DOMAIN: number = 0x0001;
 const TAG: string = 'AgentWorkspace';
 const DSH_RUNTIME_VERSION: string = '0.2.3-alpha.2';
+const DSH_PATCH_STAMP: string = '0.2.3-alpha.2-perf1';
 
 export class AgentWorkspace {
   private static instance: AgentWorkspace = new AgentWorkspace();
@@ -26,6 +27,7 @@ export class AgentWorkspace {
   private workspaceRoot: string = '/data/storage/el2/base/haps/entry/files/workspace';
   private bundleName: string = 'com.shuwei.shellbridge';
   private userId: number = 100;
+  private dshRuntimePromise: Promise<string> | null = null;
 
   static getInstance(): AgentWorkspace {
     return AgentWorkspace.instance;
@@ -51,14 +53,13 @@ export class AgentWorkspace {
     this.ensureDir(this.workspaceRoot);
     this.ensureDir(`${this.workspaceRoot}/.tmp`);
     hilog.info(DOMAIN, TAG, 'AgentWorkspace initialized at %{public}s', this.workspaceRoot);
-    // Cleanup any duplicate stray workspace/workspace dirs and rescue files
-    this.cleanupDuplicateWorkspaceDirs();
-    // Cleanup any empty directories mistakenly created with file extensions by legacy stat shim
-    this.cleanupPhantomFileDirs(this.workspaceRoot, 0);
-    // Proactively grant public directory permissions in background
-    this.ensurePermissionsSilently();
-    // Ensure CPython 3.13 standard library zip is deployed
-    this.ensurePythonZip();
+    // Defer heavy filesystem maintenance and Python stdlib checks off the cold-start critical path
+    setTimeout(() => {
+      this.cleanupDuplicateWorkspaceDirs();
+      this.cleanupPhantomFileDirs(this.workspaceRoot, 0);
+      this.ensurePermissionsSilently();
+      this.ensurePythonZip();
+    }, 4000);
   }
 
   /**
@@ -142,8 +143,20 @@ export class AgentWorkspace {
 
   /**
    * Unpacks dsh-runtime.zip from rawfile to filesDir so embedded Node can execute DSH web server.
+   * Deduplicates concurrent callers so EntryAbility and Index share one extraction/patch pass.
    */
   async ensureDshRuntime(): Promise<string> {
+    if (this.dshRuntimePromise) {
+      return this.dshRuntimePromise;
+    }
+    this.dshRuntimePromise = this.ensureDshRuntimeInner().catch((err: Object) => {
+      this.dshRuntimePromise = null;
+      throw err as Error;
+    });
+    return this.dshRuntimePromise;
+  }
+
+  private async ensureDshRuntimeInner(): Promise<string> {
     if (!this.context || !this.context.filesDir) {
       return '';
     }
@@ -223,6 +236,18 @@ export class AgentWorkspace {
     if (!this.context) {
       return;
     }
+    const stampPath = `${runtimeDir}/.swai_patch_stamp`;
+    try {
+      if (fs.accessSync(stampPath) && fs.accessSync(`${runtimeDir}/bridge/swai-tools.mjs`)) {
+        const currentStamp = fs.readTextSync(stampPath).trim();
+        if (currentStamp === DSH_PATCH_STAMP) {
+          return;
+        }
+      }
+    } catch (_stampErr) {
+      // fall through to full sync & patch
+    }
+
     // Ensure bridge directory exists before writing bridge scripts
     this.ensureDir(`${runtimeDir}/bridge`);
     // Always keep bridge scripts in sync with latest rawfiles (with dual swai & piha support)
@@ -332,6 +357,14 @@ export class AgentWorkspace {
 
     // Always enforce HarmonyOS native image processor bridge for dsh-attachment-local (replaces sharp/libvips)
     this.patchDshAttachmentLocal(runtimeDir);
+
+    try {
+      const stampFile = fs.openSync(stampPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(stampFile.fd, DSH_PATCH_STAMP);
+      fs.closeSync(stampFile);
+    } catch (_writeStampErr) {
+      // ignore stamp write failure
+    }
   }
 
   /**

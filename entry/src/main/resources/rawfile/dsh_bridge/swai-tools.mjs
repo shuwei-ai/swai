@@ -1,9 +1,11 @@
 /**
  * Swai Tools Plugin for DeepSeek Harness (DSH)
- * Exposes Swai's native privileged tools to DSH agent.
+ * Exposes Swai's native privileged tools, ArkWeb CDP browser tools,
+ * and WeChat Official Account publishing tools directly to DSH agent.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -70,6 +72,30 @@ function detectImageMediaType(targetPath, data) {
   return 'image/jpeg';
 }
 
+// Lazy-loaded drivers to keep DSH cold startup fast
+let cdpDriverInstance = null;
+async function getCdpDriver() {
+  if (!cdpDriverInstance) {
+    const mod = await import('./cdp-driver.mjs');
+    cdpDriverInstance = new mod.CdpDriver({ port: 9222 });
+  }
+  return cdpDriverInstance;
+}
+
+let wechatPosterInstance = null;
+async function getWeChatPoster() {
+  if (!wechatPosterInstance) {
+    const cdp = await getCdpDriver();
+    const mod = await import('./wechat-poster.mjs');
+    wechatPosterInstance = new mod.WeChatPoster(cdp);
+  }
+  return wechatPosterInstance;
+}
+
+function notifyShowBrowserOverlay(signal) {
+  dispatchSwaiTool('ui', { action: 'show_browser_overlay' }, 5000, { signal }).catch(() => {});
+}
+
 const CAPTURE_IMAGE_VALUE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -95,6 +121,17 @@ const CAPTURE_IMAGE_VALUE_SCHEMA = {
   }
 };
 
+const WECHAT_THEMES = [
+  'default',
+  'grace',
+  'simple',
+  'modern',
+  'editorial',
+  'cyber-minimal',
+  'aurora-warm',
+  'neo-brutalism'
+];
+
 export function apply(ctx) {
   // Inject system prompt guidance so DSH uses mobile-native tools efficiently
   if (ctx.systemPrompt && typeof ctx.systemPrompt.section === 'function') {
@@ -103,8 +140,8 @@ export function apply(ctx) {
       order: 400,
       text: () => [
         '# Mobile Host Capabilities & Web Navigation',
-        '- For viewing, opening, or interacting with webpages (including login pages, search engines, articles), ALWAYS prefer the standard MCP browser tools (`mcp__swai__browser_navigate`, `mcp__swai__browser_snapshot`, `mcp__swai__browser_click`, `mcp__swai__browser_type`, `mcp__swai__browser_evaluate`, `mcp__swai__browser_extract_text`). This activates the in-app ArkWeb overlay and performs resilient CDP automation.',
-        '- For WeChat Official Account formatting and draft publishing, use `mcp__swai__wechat_render_article` and `mcp__swai__wechat_post_draft`.',
+        '- For viewing, opening, or interacting with webpages (including login pages, search engines, articles), ALWAYS prefer the in-app ArkWeb browser tools (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_evaluate`, `browser_extract_text`). This activates the in-app ArkWeb overlay and performs resilient CDP automation.',
+        '- For WeChat Official Account formatting and draft publishing, use `wechat_render_article` and `wechat_post_draft`.',
         '- Do NOT attempt to launch external browser apps (like com.huawei.hmos.browser) via shell commands or `ui(action="launch_app")` unless explicitly requested by the user.',
         '- For HarmonyOS UI automation, use `ui`. Prefer `action="run_sequence"` for deterministic multi-step flows to save turns, `action="click_anchor"` for common navigation icons (`search`, `back`, `more`, `chat_input`, `voice_toggle`, `send`), and `use_ocr=true` or `action="ocr"` for custom/canvas views lacking accessibility labels.',
         '- For inspecting the current device screen, call `capture_screen` (hardware capture via `snapshot_display`/`uitest screenCap`). Vision-capable models receive the image inline; text-only models receive the saved file path and can follow up with `ui(action="ocr")` or `ui(action="dump_tree")`.',
@@ -367,6 +404,229 @@ export function apply(ctx) {
         text: `Captured screen to ${targetPath} (${data.length} bytes, ${mediaType}). Current model does not support direct image input or attachment service is unavailable; use ui(action="ocr") or ui(action="dump_tree") to inspect screen content.`,
         path: targetPath
       };
+    }
+  }));
+
+  // 5. In-App ArkWeb CDP Browser Navigate (`browser_navigate`)
+  ctx.tools.register(defineTool({
+    name: 'browser_navigate',
+    description: 'Navigate the in-app ArkWeb browser to a URL and inspect the loaded page.',
+    parameters: {
+      url: { type: 'string', description: 'Target website URL (e.g. https://developer.huawei.com)', required: true },
+      timeoutMs: { type: 'number', description: 'Navigation timeout in ms (default 20000)' }
+    },
+    output: {
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
+    },
+    async execute(args, exec) {
+      notifyShowBrowserOverlay(exec?.signal);
+      const cdp = await getCdpDriver();
+      const navRes = await cdp.navigate(args.url, args.timeoutMs || 20000);
+      const snap = await cdp.snapshot('both');
+
+      let out = `Successfully navigated to: ${navRes.url}\nTitle: ${navRes.title}\nLoad duration: ${navRes.durationMs}ms\n\n`;
+      if (snap.text) {
+        out += `--- Content Summary ---\n${snap.text.substring(0, 3000)}\n\n`;
+      }
+      if (snap.elements && snap.elements.length > 0) {
+        out += `--- Key Interactive Elements (${snap.elements.length} found) ---\n`;
+        const maxShow = Math.min(snap.elements.length, 25);
+        for (let i = 0; i < maxShow; i++) {
+          const el = snap.elements[i];
+          let desc = `[${el.idx}] <${el.tag}`;
+          if (el.type) desc += ` type="${el.type}"`;
+          desc += `> ${el.label || el.href || ''}`;
+          out += `${desc}\n`;
+        }
+      }
+      return { text: out.trim() };
+    }
+  }));
+
+  // 6. Browser Snapshot (`browser_snapshot`)
+  ctx.tools.register(defineTool({
+    name: 'browser_snapshot',
+    description: 'Capture readable page text and index-mapped interactive elements from current browser tab.',
+    parameters: {
+      mode: { type: 'string', enum: ['both', 'text', 'interactive'], description: 'Snapshot mode (default "both")' }
+    },
+    output: {
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
+    },
+    async execute(args) {
+      const cdp = await getCdpDriver();
+      const snap = await cdp.snapshot(args?.mode || 'both');
+      let out = `Page Title: ${snap.title}\nURL: ${snap.url}\n\n`;
+      if (snap.text) {
+        out += `--- Page Text ---\n${snap.text}\n\n`;
+      }
+      if (snap.elements && snap.elements.length > 0) {
+        out += `--- Interactive Elements ---\n`;
+        for (const el of snap.elements) {
+          out += `[${el.idx}] <${el.tag}${el.type ? ' type="' + el.type + '"' : ''}> ${el.label || el.href || ''}\n`;
+        }
+      }
+      return { text: out.trim() };
+    }
+  }));
+
+  // 7. Browser Click (`browser_click`)
+  ctx.tools.register(defineTool({
+    name: 'browser_click',
+    description: 'Click an interactive button, link, or element on the current webpage by index [1], [2] or selector.',
+    parameters: {
+      index: { type: 'number', description: 'Numeric index from previous snapshot e.g. 1, 2' },
+      selector: { type: 'string', description: 'Optional CSS selector' }
+    },
+    output: {
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
+    },
+    async execute(args) {
+      const cdp = await getCdpDriver();
+      const res = await cdp.click(args || {});
+      return { text: res.success ? res.message : `Error: ${res.message}` };
+    }
+  }));
+
+  // 8. Browser Type (`browser_type`)
+  ctx.tools.register(defineTool({
+    name: 'browser_type',
+    description: 'Type text into an input box or textarea on the current webpage.',
+    parameters: {
+      text: { type: 'string', description: 'Text to input', required: true },
+      index: { type: 'number', description: 'Numeric index from previous snapshot' },
+      selector: { type: 'string', description: 'Optional CSS selector' }
+    },
+    output: {
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
+    },
+    async execute(args) {
+      const cdp = await getCdpDriver();
+      const res = await cdp.type(args || {});
+      return { text: res.success ? res.message : `Error: ${res.message}` };
+    }
+  }));
+
+  // 9. Browser Evaluate (`browser_evaluate`)
+  ctx.tools.register(defineTool({
+    name: 'browser_evaluate',
+    description: 'Execute arbitrary JavaScript expression in the ArkWeb page context.',
+    parameters: {
+      script: { type: 'string', description: 'JavaScript code expression', required: true }
+    },
+    output: {
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
+    },
+    async execute(args) {
+      const cdp = await getCdpDriver();
+      const val = await cdp.evaluate(args.script);
+      return { text: typeof val === 'string' ? val : JSON.stringify(val, null, 2) };
+    }
+  }));
+
+  // 10. Browser Extract Text (`browser_extract_text`)
+  ctx.tools.register(defineTool({
+    name: 'browser_extract_text',
+    description: 'Quickly extract clean, readable article body text without HTML boilerplate.',
+    parameters: {},
+    output: {
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
+    },
+    async execute() {
+      const cdp = await getCdpDriver();
+      const txt = await cdp.extractText();
+      return { text: txt };
+    }
+  }));
+
+  // 11. WeChat Article Renderer (`wechat_render_article`)
+  ctx.tools.register(defineTool({
+    name: 'wechat_render_article',
+    description: 'Convert Markdown into WeChat Official Account ready HTML with inline CSS styles.',
+    parameters: {
+      markdown: { type: 'string', description: 'Markdown source text or file path on device', required: true },
+      theme: { type: 'string', enum: WECHAT_THEMES, description: 'Typography theme' },
+      color: { type: 'string', description: 'Primary color (e.g. blue, green, #07c160)' },
+      title: { type: 'string', description: 'Optional title override' },
+      author: { type: 'string', description: 'Optional author override' }
+    },
+    output: {
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
+    },
+    async execute(args) {
+      try {
+        let mdContent = args.markdown;
+        if (typeof mdContent === 'string' && fs.existsSync(mdContent)) {
+          mdContent = fs.readFileSync(mdContent, 'utf-8');
+        }
+        const { formatMarkdownToWechat } = await import('./wechat-formatter.mjs');
+        const formatted = await formatMarkdownToWechat(mdContent, {
+          theme: args.theme || 'default',
+          color: args.color,
+          title: args.title,
+          author: args.author
+        });
+        const out = `Title: ${formatted.title}\nAuthor: ${formatted.author || '(none)'}\nSummary: ${formatted.summary}\nHTML Length: ${formatted.html.length} chars\n\nPreview HTML (first 500 chars):\n${formatted.html.slice(0, 500)}...`;
+        return { text: out };
+      } catch (err) {
+        return { text: `Error: Markdown 排版失败: ${err.message}` };
+      }
+    }
+  }));
+
+  // 12. WeChat Article Draft Publisher (`wechat_post_draft`)
+  ctx.tools.register(defineTool({
+    name: 'wechat_post_draft',
+    description: 'Automatically publish or save a Markdown article to WeChat Official Account (微信公众号) draft box via ArkWeb browser automation.',
+    parameters: {
+      markdown: { type: 'string', description: 'Markdown text content or local file path to publish', required: true },
+      title: { type: 'string', description: 'Optional article title override' },
+      author: { type: 'string', description: 'Optional author name override' },
+      summary: { type: 'string', description: 'Optional summary / description override' },
+      theme: { type: 'string', enum: WECHAT_THEMES, description: 'Typography theme (default "default")' },
+      color: { type: 'string', description: 'Primary theme color preset or hex' },
+      saveDraft: { type: 'boolean', description: 'Whether to click save draft automatically (default true)' }
+    },
+    output: {
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
+    },
+    async execute(args, exec) {
+      try {
+        notifyShowBrowserOverlay(exec?.signal);
+        let mdContent = args.markdown;
+        if (typeof mdContent === 'string' && fs.existsSync(mdContent)) {
+          mdContent = fs.readFileSync(mdContent, 'utf-8');
+        }
+        const poster = await getWeChatPoster();
+        const res = await poster.publishMarkdown(mdContent, {
+          title: args.title,
+          author: args.author,
+          summary: args.summary,
+          theme: args.theme || 'default',
+          color: args.color,
+          saveDraft: args.saveDraft !== false
+        });
+
+        if (res.status === 'need_login') {
+          return {
+            text: `⚠️ 微信公众号尚未登录！\n\n${res.message}\n已解析文章标题: ${res.title}\n摘要: ${res.summary}\n\n👉 提示：请在真机屏幕右侧浏览器中扫码登录微信公众号，登录完成后再次调用此命令即可直接保存草稿！`
+          };
+        }
+
+        return {
+          text: `✅ 微信公众号草稿创建成功！\n\n标题: ${res.title}\n作者: ${res.author || '(未设置)'}\n摘要: ${res.summary}\n保存状态: ${res.saveResult}${res.appmsgid ? '\nDraft ID: ' + res.appmsgid : ''}`
+        };
+      } catch (err) {
+        return { text: `Error: 微信公众号草稿自动化失败: ${err.message}` };
+      }
     }
   }));
 }

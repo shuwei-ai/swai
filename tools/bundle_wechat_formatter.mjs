@@ -33,21 +33,25 @@ const EMBEDDED_CODE_THEMES = ${JSON.stringify(codeThemes)};
 // Mock fs.existsSync and fs.readFileSync for theme loading
 const originalExistsSync = fs.existsSync;
 fs.existsSync = function(p) {
-  const base = path.basename(p);
-  if (EMBEDDED_THEMES[base] !== undefined || EMBEDDED_CODE_THEMES[base] !== undefined) {
-    return true;
+  if (typeof p === 'string') {
+    const base = path.basename(p);
+    if (EMBEDDED_THEMES[base] !== undefined || EMBEDDED_CODE_THEMES[base] !== undefined) {
+      return true;
+    }
   }
   return originalExistsSync.apply(this, arguments);
 };
 
 const originalReadFileSync = fs.readFileSync;
 fs.readFileSync = function(p, enc) {
-  const base = path.basename(p);
-  if (EMBEDDED_THEMES[base] !== undefined) {
-    return EMBEDDED_THEMES[base];
-  }
-  if (EMBEDDED_CODE_THEMES[base] !== undefined) {
-    return EMBEDDED_CODE_THEMES[base];
+  if (typeof p === 'string') {
+    const base = path.basename(p);
+    if (EMBEDDED_THEMES[base] !== undefined) {
+      return EMBEDDED_THEMES[base];
+    }
+    if (EMBEDDED_CODE_THEMES[base] !== undefined) {
+      return EMBEDDED_CODE_THEMES[base];
+    }
   }
   return originalReadFileSync.apply(this, arguments);
 };
