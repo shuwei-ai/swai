@@ -30,6 +30,129 @@ function renderTextOutput(_args, value) {
   }];
 }
 
+function resolveDshSkillsDir() {
+  const dshHome = process.env.DSH_HOME || (process.env.HOME ? path.join(process.env.HOME, '.dsh') : null);
+  if (dshHome && dshHome.trim().length > 0) {
+    return path.join(dshHome.trim(), 'skills');
+  }
+  return path.join(process.cwd(), '.dsh', 'skills');
+}
+
+// Sanitized UI trajectory buffer (password/input text is NEVER stored verbatim; always redacted)
+const UI_TRACE_MAX = 60;
+const uiTraceBuffer = [];
+
+function redactUiTargetSummary(action, args) {
+  if (!args || typeof args !== 'object') return action;
+  if (action === 'input_text') {
+    const loc = args.ref || args.text || args.id || args.contains_text || (args.x !== undefined ? `(${args.x},${args.y})` : 'focused');
+    return `${loc} <- <输入内容>${args.auto_send ? ' +auto_send' : ''}`;
+  }
+  if (action === 'run_sequence' && Array.isArray(args.steps)) {
+    const ops = args.steps.slice(0, 12).map((s) => {
+      const op = String(s?.op || 'step');
+      if (op === 'type') {
+        const tgt = s?.ref || s?.target || 'input';
+        return `type(${tgt}, <输入内容>${s?.auto_send ? ', auto_send' : ''})`;
+      }
+      if (op === 'click_anchor' && s?.anchor) return `click_anchor(${s.anchor})`;
+      if (op === 'launch' && s?.bundle_name) return `launch(${s.bundle_name})`;
+      if (op === 'tap') return `tap(${s?.ref || s?.target || s?.text || ''})`;
+      return op;
+    });
+    return ops.join(' -> ');
+  }
+  if (action === 'click_anchor') return String(args.anchor || '');
+  if (action === 'click_point') return `(${args.x},${args.y})`;
+  if (action === 'swipe') return String(args.direction || `(${args.x1},${args.y1})->(${args.x2},${args.y2})`);
+  return String(args.ref || args.text || args.contains_text || args.id || args.bundle_name || '');
+}
+
+function extractUiOutputMeta(outputText, fallbackBundle) {
+  const text = String(outputText || '');
+  const appMatch = /\bApp:\s*([^\s|]+)/.exec(text);
+  const pageMatch = /\bPage:\s*([^\s|]+)/.exec(text);
+  const qualityMatch = /\bTreeQuality:\s*([^\s|]+)/.exec(text);
+  const effectMatch = /\[ACTION EFFECT\]:\s*([^\r\n]+)/.exec(text);
+  return {
+    bundleName: appMatch && appMatch[1] !== 'unknown' ? appMatch[1] : (fallbackBundle || ''),
+    pagePath: pageMatch && pageMatch[1] !== 'unknown' ? pageMatch[1] : '',
+    treeQuality: qualityMatch ? qualityMatch[1] : '',
+    effect: effectMatch ? effectMatch[1].trim() : ''
+  };
+}
+
+function recordUiTrace(action, args, res) {
+  const outputText = res?.ok ? (res.output || '') : (res?.error || '');
+  const meta = extractUiOutputMeta(outputText, typeof args?.bundle_name === 'string' ? args.bundle_name.trim() : '');
+  uiTraceBuffer.push({
+    ts: new Date().toISOString(),
+    action,
+    bundleName: meta.bundleName || 'unknown',
+    pagePath: meta.pagePath || '',
+    target: redactUiTargetSummary(action, args),
+    treeQuality: meta.treeQuality || '',
+    effect: meta.effect || '',
+    ok: Boolean(res?.ok)
+  });
+  if (uiTraceBuffer.length > UI_TRACE_MAX) {
+    uiTraceBuffer.splice(0, uiTraceBuffer.length - UI_TRACE_MAX);
+  }
+}
+
+export function getSanitizedUiTrace() {
+  return uiTraceBuffer.map((entry) => ({ ...entry }));
+}
+
+export function clearSanitizedUiTrace() {
+  uiTraceBuffer.length = 0;
+}
+
+const REQUIRED_SKILL_SECTIONS = [
+  '入口',
+  '步骤',
+  '容易出错的地方',
+  '怎样算办成',
+  '什么时候停下交给用户'
+];
+
+const SENSITIVE_CONTENT_PATTERNS = [
+  /\b\d{6}\b/, // potential 6-digit OTP / PIN
+  /(password|passwd|pin_?code|验证码|密码)\s*[:：=]\s*[^\s<]{3,}/i,
+  /\b\d{15,19}\b/ // bank card number
+];
+
+function validateUiSkillDraft(name, description, markdown) {
+  const cleanName = String(name || '').trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{1,62}$/.test(cleanName)) {
+    return { ok: false, error: 'Skill name must be kebab-case alphanumeric (2-63 chars, e.g. "wechat-daily-digest").' };
+  }
+  const cleanDesc = String(description || '').trim();
+  if (cleanDesc.length < 6) {
+    return { ok: false, error: 'Skill description must be a clear non-empty sentence.' };
+  }
+  const body = String(markdown || '').trim();
+  if (body.length < 40) {
+    return { ok: false, error: 'Skill markdown body is too short.' };
+  }
+  const missing = REQUIRED_SKILL_SECTIONS.filter((sec) => !body.includes(sec));
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      error: `Skill markdown must contain the 5 standard sections (${REQUIRED_SKILL_SECTIONS.join(' / ')}). Missing: ${missing.join(', ')}`
+    };
+  }
+  for (const pat of SENSITIVE_CONTENT_PATTERNS) {
+    if (pat.test(body) || pat.test(cleanDesc)) {
+      return {
+        ok: false,
+        error: 'Rejected potential literal sensitive data (OTP/password/card number). Parameterize user inputs with placeholders like <联系人> or <内容>.'
+      };
+    }
+  }
+  return { ok: true, name: cleanName, description: cleanDesc.replace(/\s+/g, ' '), markdown: body };
+}
+
 function shellSingleQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
@@ -143,7 +266,7 @@ export function apply(ctx) {
         '- For viewing, opening, or interacting with webpages (including login pages, search engines, articles), ALWAYS prefer the in-app ArkWeb browser tools (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_evaluate`, `browser_extract_text`). This activates the in-app ArkWeb overlay and performs resilient CDP automation.',
         '- For WeChat Official Account formatting and draft publishing, use `wechat_render_article` and `wechat_post_draft`.',
         '- Do NOT attempt to launch external browser apps (like com.huawei.hmos.browser) via shell commands or `ui(action="launch_app")` unless explicitly requested by the user.',
-        '- For HarmonyOS UI automation, use `ui`. Prefer `action="run_sequence"` for deterministic multi-step flows to save turns, `action="click_anchor"` for common navigation icons (`search`, `back`, `more`, `chat_input`, `voice_toggle`, `send`), and `use_ocr=true` or `action="ocr"` for custom/canvas views lacking accessibility labels.',
+        '- For HarmonyOS UI automation, check loaded DSH skills (such as `hmos-ui-automation` or app-specific skills like `wechat-ui-automation`) via `skill` tool when automating phone apps. Use `ui` (`action="list_apps"` to discover real HarmonyOS bundle names, `dump_tree` reading App/Page/TreeQuality/@ref/id, `click_anchor` for unlabeled icons, `ocr` automatically cropped to the target window, and `run_sequence` for deterministic multi-step flows). After completing a repeatable multi-step UI task, use `ui_skill_save` (`inspect_trace` -> `save`) to save a reusable 5-section skill.',
         '- For inspecting the current device screen, call `capture_screen` (hardware capture via `snapshot_display`/`uitest screenCap`). Vision-capable models receive the image inline; text-only models receive the saved file path and can follow up with `ui(action="ocr")` or `ui(action="dump_tree")`.',
         '- You have direct access to `glob` and `grep` (in-process native filesystem search), `read`/`write`/`edit` for workspace files, `bash` for HarmonyOS system commands (runs with `uid=2000` and automatically bridges `/data/storage/` sandbox paths via debug mount), `offline_code` for Python 3.13 / JS V8 execution (supports `code` or workspace `path`, `import hdc`, `import pip`, and `PIL`), and `remote_bash` for remote server execution via SSH.'
       ].join('\n')
@@ -169,6 +292,7 @@ export function apply(ctx) {
           'back',
           'home',
           'launch_app',
+          'list_apps',
           'hide_overlay',
           'show_overlay',
           'minimize_overlay'
@@ -178,6 +302,8 @@ export function apply(ctx) {
       },
       bundle_name: { type: 'string', description: 'Target bundle name to isolate layout or launch (e.g. "com.huawei.hmos.notepad")' },
       ability_name: { type: 'string', description: 'Target UIAbility name for launch_app (default: "EntryAbility")' },
+      clone_index: { type: 'number', description: 'For launch_app when a "选择打开方式" app-clone chooser appears: 0-based index to auto-select (default: 0 = first/main app)' },
+      auto_select_clone: { type: 'boolean', description: 'For launch_app: automatically select clone_index if "选择打开方式" chooser appears (default: true)' },
       text: { type: 'string', description: 'Exact or preferred visible text/hint/description to match' },
       contains_text: { type: 'string', description: 'Case-insensitive substring match against element text/hint/description/id' },
       id: { type: 'string', description: 'Component resource ID to match' },
@@ -224,6 +350,7 @@ export function apply(ctx) {
     },
     async execute(args, exec) {
       const res = await dispatchSwaiTool('ui', args, 45000, { signal: exec?.signal });
+      recordUiTrace(String(args?.action || 'unknown'), args, res);
       return { text: res.ok ? (res.output || 'Success') : `Error: ${res.error || 'UI action failed'}` };
     }
   }));
@@ -326,9 +453,10 @@ export function apply(ctx) {
       const escapedTarget = shellSingleQuote(targetPath);
       const isJpeg = targetPath.toLowerCase().endsWith('.jpeg');
       const fallbackTmp = shellSingleQuote(path.join(tempDir, `_snap_${randomUUID().slice(0, 8)}.jpeg`));
+      const tmpLocal = shellSingleQuote(`/data/local/tmp/_swai_cap_${randomUUID().slice(0, 8)}.jpeg`);
       const snapCmd = isJpeg
-        ? `rm -f ${escapedTarget} && (snapshot_display -f ${escapedTarget} >/dev/null 2>&1 || uitest screenCap -p ${escapedTarget} >/dev/null 2>&1) && [ -s ${escapedTarget} ]`
-        : `rm -f ${escapedTarget} ${fallbackTmp} && (uitest screenCap -p ${escapedTarget} >/dev/null 2>&1 || (snapshot_display -f ${fallbackTmp} >/dev/null 2>&1 && mv ${fallbackTmp} ${escapedTarget})) && [ -s ${escapedTarget} ]`;
+        ? `rm -f ${escapedTarget} ${tmpLocal} && ((snapshot_display -f ${escapedTarget} >/dev/null 2>&1 && [ -s ${escapedTarget} ]) || (snapshot_display -f ${tmpLocal} >/dev/null 2>&1 && [ -s ${tmpLocal} ] && cp ${tmpLocal} ${escapedTarget}) || (uitest screenCap -p ${tmpLocal} >/dev/null 2>&1 && [ -s ${tmpLocal} ] && cp ${tmpLocal} ${escapedTarget})) && chmod 666 ${escapedTarget} 2>/dev/null; rm -f ${tmpLocal}; [ -s ${escapedTarget} ]`
+        : `rm -f ${escapedTarget} ${fallbackTmp} ${tmpLocal} && ((uitest screenCap -p ${escapedTarget} >/dev/null 2>&1 && [ -s ${escapedTarget} ]) || (uitest screenCap -p ${tmpLocal} >/dev/null 2>&1 && [ -s ${tmpLocal} ] && cp ${tmpLocal} ${escapedTarget}) || (snapshot_display -f ${tmpLocal} >/dev/null 2>&1 && [ -s ${tmpLocal} ] && cp ${tmpLocal} ${escapedTarget})) && chmod 666 ${escapedTarget} 2>/dev/null; rm -f ${tmpLocal}; [ -s ${escapedTarget} ]`;
 
       const snapRes = await dispatchSwaiTool('bash', { command: snapCmd, timeout_seconds: 15 }, 20000, { signal: exec?.signal });
       if (!snapRes.ok) {
@@ -629,4 +757,201 @@ export function apply(ctx) {
       }
     }
   }));
+
+  // 13. UI Automation Trajectory Inspector & Skill Saver (`ui_skill_save`)
+  ctx.tools.register(defineTool({
+    name: 'ui_skill_save',
+    description: 'Inspect sanitized HarmonyOS UI automation action trajectory (with typed inputs redacted) or save a verified 5-section UI automation SKILL.md directly into DSH native skills directory (.dsh/skills) for immediate reuse.',
+    parameters: {
+      mode: {
+        type: 'string',
+        enum: ['inspect_trace', 'save'],
+        description: 'Operation mode: "inspect_trace" returns recent sanitized ui actions (bundle, pagePath, target, effect); "save" validates and writes SKILL.md (default: "save").'
+      },
+      name: { type: 'string', description: 'Kebab-case skill name (e.g. "wechat-group-summary"). Required when mode="save".' },
+      description: { type: 'string', description: 'One-sentence description of when to use this skill. Required when mode="save".' },
+      markdown: {
+        type: 'string',
+        description: 'Structured skill body containing the 5 sections: 入口, 步骤, 容易出错的地方, 怎样算办成, 什么时候停下交给用户. Use placeholders like <联系人> instead of literal typed text.'
+      },
+      status: {
+        type: 'string',
+        enum: ['trial', 'active'],
+        description: 'Lifecycle maturity of the saved skill (default: "trial").'
+      },
+      apps: {
+        type: 'array',
+        description: 'Optional HarmonyOS bundle names used by this skill (e.g. ["com.tencent.wechat"]).',
+        items: { type: 'string' }
+      }
+    },
+    output: {
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: renderTextOutput
+    },
+    async execute(args) {
+      const mode = String(args?.mode || 'save').trim();
+      if (mode === 'inspect_trace') {
+        if (uiTraceBuffer.length === 0) {
+          return { text: 'No UI automation steps recorded in this session yet.' };
+        }
+        const lines = [`Sanitized UI Trajectory (${uiTraceBuffer.length} steps, typed inputs redacted):`];
+        for (let i = 0; i < uiTraceBuffer.length; i++) {
+          const item = uiTraceBuffer[i];
+          const pageSuffix = item.pagePath ? ` page=${item.pagePath}` : '';
+          const effSuffix = item.effect ? ` -> ${item.effect}` : '';
+          const status = item.ok ? 'OK' : 'FAIL';
+          lines.push(`${i + 1}. [${status}] app=${item.bundleName}${pageSuffix} | ${item.action} ${item.target}${effSuffix}`);
+        }
+        return { text: lines.join('\n') };
+      }
+
+      if (mode !== 'save') {
+        return { text: `Error: Unknown ui_skill_save mode "${mode}". Use "inspect_trace" or "save".` };
+      }
+
+      const validation = validateUiSkillDraft(args?.name, args?.description, args?.markdown);
+      if (!validation.ok) {
+        return { text: `Error: ${validation.error}` };
+      }
+
+      const status = args?.status === 'active' ? 'active' : 'trial';
+      const appsList = Array.isArray(args?.apps)
+        ? args.apps.map((a) => String(a || '').trim()).filter((a) => a.length > 0)
+        : [];
+      const metadataLines = [
+        'metadata:',
+        `  status: ${JSON.stringify(status)}`,
+        '  source: "ui-automation"'
+      ];
+      if (appsList.length > 0) {
+        metadataLines.push('  apps:');
+        for (const appPkg of appsList) {
+          metadataLines.push(`    - ${JSON.stringify(appPkg)}`);
+        }
+      }
+
+      const skillDoc = [
+        '---',
+        `name: ${JSON.stringify(validation.name)}`,
+        `description: ${JSON.stringify(validation.description)}`,
+        ...metadataLines,
+        '---',
+        '',
+        validation.markdown,
+        ''
+      ].join('\n');
+
+      const skillsRoot = resolveDshSkillsDir();
+      const targetDir = path.join(skillsRoot, validation.name);
+      const targetPath = path.join(targetDir, 'SKILL.md');
+      await fsp.mkdir(targetDir, { recursive: true });
+      await fsp.writeFile(targetPath, skillDoc, 'utf-8');
+
+      return {
+        text: `Saved UI automation skill "${validation.name}" (status=${status}) to ${targetPath}. It is now discoverable via the DSH skill catalog and /${validation.name}.`
+      };
+    }
+  }));
+
+  // 14. Background Thinking Capsule lifecycle hooks (DSH Cordis agent events -> Swai host)
+  if (typeof ctx?.on === 'function') {
+    const activeAgents = new Set();
+    const latestReplyByAgent = new Map();
+    const latestErrorByAgent = new Map();
+    let lastThinkingEmitMs = 0;
+
+    const extractReplyText = (chunk) => {
+      if (!chunk) return '';
+      if (typeof chunk === 'string') return chunk;
+      if (typeof chunk === 'object') {
+        const ctype = String(chunk.type || '').toLowerCase();
+        if (ctype.includes('reason') || ctype.includes('thinking') || ctype.includes('tool')) {
+          return '';
+        }
+        if (typeof chunk.text === 'string') return chunk.text;
+        if (typeof chunk.delta === 'string') return chunk.delta;
+        if (typeof chunk.content === 'string') return chunk.content;
+      }
+      return '';
+    };
+
+    const sanitizeSummary = (raw) => {
+      if (!raw || typeof raw !== 'string') return '';
+      const oneLine = raw
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/[*_`#>]+/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return oneLine.length > 32 ? `${oneLine.slice(0, 32)}…` : oneLine;
+    };
+
+    try {
+      ctx.on('agent/status', (payload) => {
+        try {
+          const agentId = String(payload?.agent?.id || payload?.agentId || 'default');
+          const status = String(payload?.status || '');
+          if (status === 'running') {
+            activeAgents.add(agentId);
+            latestErrorByAgent.delete(agentId);
+            latestReplyByAgent.set(agentId, '');
+            dispatchSwaiTool('swai_capsule_event', { event: 'turn_start' }, 2000).catch(() => {});
+          } else if (status === 'idle') {
+            activeAgents.delete(agentId);
+            if (activeAgents.size === 0) {
+              const errMsg = latestErrorByAgent.get(agentId) || '';
+              latestErrorByAgent.delete(agentId);
+              const summary = sanitizeSummary(latestReplyByAgent.get(agentId) || '');
+              latestReplyByAgent.delete(agentId);
+              dispatchSwaiTool(
+                'swai_capsule_event',
+                {
+                  event: errMsg ? 'turn_error' : 'turn_done',
+                  summary,
+                  error: errMsg
+                },
+                2000
+              ).catch(() => {});
+            }
+          }
+        } catch (_) {}
+      }, { global: true });
+
+      ctx.on('agent/error', (payload) => {
+        try {
+          const agentId = String(payload?.agent?.id || payload?.agentId || 'default');
+          const rawErr = payload?.error?.message || payload?.error || '任务执行出错';
+          const shortErr = String(rawErr).replace(/\s+/g, ' ').trim().slice(0, 48);
+          latestErrorByAgent.set(agentId, shortErr);
+          dispatchSwaiTool('swai_capsule_event', { event: 'turn_error', error: shortErr }, 2000).catch(() => {});
+        } catch (_) {}
+      }, { global: true });
+
+      ctx.on('agent/assistant-stream', (payload) => {
+        try {
+          const agentId = String(payload?.agent?.id || payload?.agentId || 'default');
+          const frame = payload?.frame;
+          if (!frame) return;
+          if (frame.type === 'start') {
+            latestReplyByAgent.set(agentId, '');
+            const now = Date.now();
+            if (now - lastThinkingEmitMs >= 1500) {
+              lastThinkingEmitMs = now;
+              dispatchSwaiTool('swai_capsule_event', { event: 'thinking' }, 2000).catch(() => {});
+            }
+          } else if (frame.type === 'chunk') {
+            const delta = extractReplyText(frame.chunk);
+            if (delta.length > 0) {
+              const prev = latestReplyByAgent.get(agentId) || '';
+              if (prev.length < 240) {
+                latestReplyByAgent.set(agentId, (prev + delta).slice(0, 240));
+              }
+            }
+          }
+        } catch (_) {}
+      }, { global: true });
+    } catch (_) {
+      // Ignore if host Cordis instance restricts global subscriptions
+    }
+  }
 }

@@ -18,7 +18,8 @@ import { BridgeController } from '../../common/BridgeController';
 const DOMAIN: number = 0x0001;
 const TAG: string = 'AgentWorkspace';
 const DSH_RUNTIME_VERSION: string = '0.2.3-alpha.2';
-const DSH_PATCH_STAMP: string = '0.2.3-alpha.2-perf1';
+const DSH_ARCHIVE_STAMP: string = '0.2.3-alpha.2-slim2-bundle1';
+const DSH_PATCH_STAMP: string = '0.2.3-alpha.2-perf6';
 
 export class AgentWorkspace {
   private static instance: AgentWorkspace = new AgentWorkspace();
@@ -53,13 +54,38 @@ export class AgentWorkspace {
     this.ensureDir(this.workspaceRoot);
     this.ensureDir(`${this.workspaceRoot}/.tmp`);
     hilog.info(DOMAIN, TAG, 'AgentWorkspace initialized at %{public}s', this.workspaceRoot);
-    // Defer heavy filesystem maintenance and Python stdlib checks off the cold-start critical path
+    // Defer heavy filesystem maintenance and Python stdlib checks well past DSH & UI startup
     setTimeout(() => {
+      this.cleanupStaleRuntimeDirs();
       this.cleanupDuplicateWorkspaceDirs();
       this.cleanupPhantomFileDirs(this.workspaceRoot, 0);
       this.ensurePermissionsSilently();
       this.ensurePythonZip();
-    }, 4000);
+    }, 12000);
+  }
+
+  getDshRuntimeDir(): string {
+    const filesDir = this.context?.filesDir ?? '/data/storage/el2/base/haps/entry/files';
+    return `${filesDir}/dsh-runtime`;
+  }
+
+  private cleanupStaleRuntimeDirs(): void {
+    if (!this.context || !this.context.filesDir) {
+      return;
+    }
+    const filesDir = this.context.filesDir;
+    try {
+      const entries = fs.listFileSync(filesDir);
+      for (let i = 0; i < entries.length; i++) {
+        const name = entries[i];
+        if (name && name.startsWith('dsh-runtime.stale.')) {
+          const target = `${filesDir}/${name}`;
+          fs.rmdir(target).then(() => {
+            hilog.info(DOMAIN, TAG, 'Cleaned up stale runtime dir: %{public}s', target);
+          }).catch((_rmErr: Object) => {});
+        }
+      }
+    } catch (_e) {}
   }
 
   /**
@@ -160,64 +186,98 @@ export class AgentWorkspace {
     if (!this.context || !this.context.filesDir) {
       return '';
     }
+    const began = Date.now();
     const runtimeDir = `${this.context.filesDir}/dsh-runtime`;
     const binJs = `${runtimeDir}/node_modules/@deepseek-ai/dsh/lib/bin.js`;
     const dshPkgJson = `${runtimeDir}/node_modules/@deepseek-ai/dsh/package.json`;
+    const archiveStampPath = `${runtimeDir}/.swai_archive_stamp`;
 
     let alreadyExtracted = false;
     let installedVersion = '';
+    let archiveStamp = '';
     try {
-      if (fs.accessSync(binJs) && fs.accessSync(dshPkgJson)) {
+      if (fs.accessSync(binJs) && fs.accessSync(dshPkgJson) && fs.accessSync(archiveStampPath)) {
         const pkgContent = fs.readTextSync(dshPkgJson);
         const pkgObj = JSON.parse(pkgContent) as Record<string, Object>;
         if (pkgObj && typeof pkgObj.version === 'string') {
           installedVersion = pkgObj.version as string;
         }
-        alreadyExtracted = (installedVersion === DSH_RUNTIME_VERSION);
+        archiveStamp = fs.readTextSync(archiveStampPath).trim();
+        alreadyExtracted = (installedVersion === DSH_RUNTIME_VERSION && archiveStamp === DSH_ARCHIVE_STAMP);
       }
     } catch (_e) {
       alreadyExtracted = false;
     }
 
     if (!alreadyExtracted) {
-      hilog.info(DOMAIN, TAG, 'Updating dsh-runtime from %{public}s to %{public}s',
-        installedVersion || 'none', DSH_RUNTIME_VERSION);
+      hilog.info(DOMAIN, TAG, 'Updating dsh-runtime from %{public}s (%{public}s) to %{public}s (%{public}s)',
+        installedVersion || 'none', archiveStamp || 'legacy', DSH_RUNTIME_VERSION, DSH_ARCHIVE_STAMP);
+      // Move old runtime tree aside in O(1) and delete asynchronously so UI thread never hits sysfreeze
+      const staleDir = `${this.context.filesDir}/dsh-runtime.stale.${Date.now()}`;
+      let movedStale = false;
       try {
         if (fs.accessSync(runtimeDir)) {
-          fs.rmdirSync(runtimeDir);
+          fs.renameSync(runtimeDir, staleDir);
+          movedStale = true;
         }
-      } catch (_rmErr) {
-        hilog.warn(DOMAIN, TAG, 'Failed to clean old dsh-runtime dir: %{public}s', `${_rmErr}`);
+      } catch (_rnErr) {
+        hilog.warn(DOMAIN, TAG, 'Failed to rename old dsh-runtime dir, falling back to async rmdir: %{public}s', `${_rnErr}`);
+        try {
+          if (fs.accessSync(runtimeDir)) {
+            await fs.rmdir(runtimeDir);
+          }
+        } catch (_rmErr) {
+          hilog.warn(DOMAIN, TAG, 'Failed to clean old dsh-runtime dir: %{public}s', `${_rmErr}`);
+        }
       }
+      if (movedStale) {
+        fs.rmdir(staleDir).then(() => {
+          hilog.info(DOMAIN, TAG, 'Asynchronously removed stale runtime dir: %{public}s', staleDir);
+        }).catch((_rmErr: Object) => {});
+      }
+
       try {
         const zipDest = `${this.context.filesDir}/dsh-runtime.zip`;
-        hilog.info(DOMAIN, TAG, 'Extracting dsh-runtime.zip from rawfile...');
+        hilog.info(DOMAIN, TAG, 'Extracting dsh-runtime.zip from rawfile asynchronously...');
 
         try {
-          fs.mkdirSync(runtimeDir);
+          await fs.mkdir(runtimeDir);
         } catch (_m) {}
 
-        let fdObj = this.context.resourceManager.getRawFdSync('dsh-runtime.zip');
-        let out = fs.openSync(zipDest, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-        let copyBuf = new ArrayBuffer(1024 * 1024);
+        const fdObj = await this.context.resourceManager.getRawFd('dsh-runtime.zip');
+        let rawClosed = false;
+        let out: fs.File | null = null;
         let totalRead = 0;
-        let targetLen = fdObj.length;
-        while (totalRead < targetLen) {
-          let chunkLen = Math.min(copyBuf.byteLength, targetLen - totalRead);
-          let n = fs.readSync(fdObj.fd, copyBuf, { offset: fdObj.offset + totalRead, length: chunkLen });
-          if (n <= 0) break;
-          fs.writeSync(out.fd, copyBuf, { length: n });
-          totalRead += n;
+        try {
+          out = await fs.open(zipDest, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+          const copyBuf = new ArrayBuffer(1024 * 1024);
+          const targetLen = fdObj.length;
+          while (totalRead < targetLen) {
+            const chunkLen = Math.min(copyBuf.byteLength, targetLen - totalRead);
+            const n = await fs.read(fdObj.fd, copyBuf, { offset: fdObj.offset + totalRead, length: chunkLen });
+            if (n <= 0) break;
+            await fs.write(out.fd, copyBuf, { length: n });
+            totalRead += n;
+          }
+        } finally {
+          if (out !== null) {
+            try { await fs.close(out); } catch (_ce) {}
+          }
+          if (!rawClosed) {
+            rawClosed = true;
+            try { await this.context.resourceManager.closeRawFd('dsh-runtime.zip'); } catch (_re) {}
+          }
         }
-        fs.closeSync(out);
-        this.context.resourceManager.closeRawFdSync('dsh-runtime.zip');
         hilog.info(DOMAIN, TAG, 'dsh-runtime.zip copied (%{public}d bytes), decompressing...', totalRead);
 
         await zlib.decompressFile(zipDest, runtimeDir);
         hilog.info(DOMAIN, TAG, 'dsh-runtime decompressed successfully to %{public}s', runtimeDir);
         try {
-          fs.unlinkSync(zipDest);
-        } catch (_u) {}
+          const stampFile = await fs.open(archiveStampPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+          await fs.write(stampFile.fd, DSH_ARCHIVE_STAMP);
+          await fs.close(stampFile);
+        } catch (_asErr) {}
+        fs.unlink(zipDest).catch((_u: Object) => {});
       } catch (err) {
         hilog.error(DOMAIN, TAG, 'ensureDshRuntime failed: %{public}s', `${err}`);
         return '';
@@ -225,6 +285,8 @@ export class AgentWorkspace {
     }
 
     this.syncAndPatchDshRuntime(runtimeDir);
+    hilog.info(DOMAIN, TAG, '[Startup] ensureDshRuntimeInner finished in %{public}d ms (cached=%{public}s)',
+      Date.now() - began, alreadyExtracted ? 'true' : 'false');
     return runtimeDir;
   }
 
@@ -359,6 +421,18 @@ export class AgentWorkspace {
     this.patchDshAttachmentLocal(runtimeDir);
 
     try {
+      const ccDir = `${runtimeDir}/.compile-cache`;
+      const filesDir = this.context?.filesDir ?? '';
+      if (fs.accessSync(ccDir) && filesDir.length > 0) {
+        const staleCcDir = `${filesDir}/dsh-runtime.stale.cc.${Date.now()}`;
+        fs.renameSync(ccDir, staleCcDir);
+        fs.rmdir(staleCcDir).catch((_rmCcErr: Object) => {});
+      } else if (fs.accessSync(ccDir)) {
+        fs.rmdir(ccDir).catch((_rmCcErr: Object) => {});
+      }
+    } catch (_ccErr) {}
+
+    try {
       const stampFile = fs.openSync(stampPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
       fs.writeSync(stampFile.fd, DSH_PATCH_STAMP);
       fs.closeSync(stampFile);
@@ -377,8 +451,8 @@ export class AgentWorkspace {
       const indexHtmlPath = `${runtimeDir}/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html`;
       if (fs.accessSync(indexHtmlPath)) {
         let html = fs.readTextSync(indexHtmlPath);
-        if (!html.includes('swai-window-open-shim')) {
-          const shim = `<script id="swai-window-open-shim">
+        if (!html.includes('swai-window-open-shim-v2')) {
+          const shim = `<script id="swai-window-open-shim-v2">
 (function() {
   function openExternal(url) {
     if (!url || url === 'about:blank') return;
@@ -397,6 +471,66 @@ export class AgentWorkspace {
       }, 100);
     }
   }
+  var __uiMountedNotified = false;
+  function notifyUiMountedOnce() {
+    if (__uiMountedNotified) return;
+    var root = document.getElementById('root');
+    if (!root || root.children.length === 0) return;
+    if (window.swaiBridge && typeof window.swaiBridge.notifyUiMounted === 'function') {
+      __uiMountedNotified = true;
+      window.swaiBridge.notifyUiMounted();
+    }
+  }
+  function setupMountWatcher() {
+    var root = document.getElementById('root');
+    if (!root) {
+      setTimeout(setupMountWatcher, 30);
+      return;
+    }
+    notifyUiMountedOnce();
+    if (!__uiMountedNotified && typeof MutationObserver !== 'undefined') {
+      var mo = new MutationObserver(function() {
+        if (root.children.length > 0) {
+          notifyUiMountedOnce();
+          if (__uiMountedNotified) mo.disconnect();
+        }
+      });
+      mo.observe(root, { childList: true });
+    }
+    if (!__uiMountedNotified) {
+      var pollTries = 0;
+      var pollTimer = setInterval(function() {
+        pollTries++;
+        notifyUiMountedOnce();
+        if (__uiMountedNotified || pollTries > 40) clearInterval(pollTimer);
+      }, 50);
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupMountWatcher, { once: true });
+  } else {
+    setupMountWatcher();
+  }
+  window.__swaiFillDraft = function(text) {
+    if (!text) return false;
+    try {
+      var el = document.querySelector('#root textarea') || document.querySelector('textarea') || document.querySelector('#root [contenteditable="true"]');
+      if (!el) return false;
+      if (el.tagName === 'TEXTAREA') {
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+        if (setter && setter.set) setter.set.call(el, text);
+        else el.value = text;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      } else {
+        el.textContent = text;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      el.focus();
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  };
   var origOpen = window.open;
   window.open = function(url, target, features) {
     console.log('[SwaiShim] window.open intercepted:', url, target);
@@ -465,6 +599,7 @@ export class AgentWorkspace {
   }, true);
 })();
 </script>`;
+          html = html.replace(/<script id="swai-window-open-shim">[\s\S]*?<\/script>\s*/i, '');
           if (html.includes('<head>')) {
             html = html.replace('<head>', '<head>\n    ' + shim);
             const file = fs.openSync(indexHtmlPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);

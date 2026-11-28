@@ -5,10 +5,12 @@
  */
 import { BridgeController } from '../../common/BridgeController';
 import { ToolDefinition, ToolFunctionDefinition, ToolParameters, ToolProperty, ToolResult } from '../types';
-import { UiLayoutParser, UiNode, UiNodeQuery, UiTreeParseResult } from './UiLayoutParser';
+import { UiBounds, UiLayoutParser, UiNode, UiNodeQuery, UiTreeParseResult } from './UiLayoutParser';
 import { VisualAffordanceEngine } from './VisualAffordanceEngine';
-import { PhoneOcr, OcrResult } from '../ocr/PhoneOcr';
+import { PhoneOcr, OcrRoiBounds } from '../ocr/PhoneOcr';
+import { AppKnowledgeBase } from '../knowledge/AppKnowledgeBase';
 import { FloatWindowManager } from '../../window/FloatWindowManager';
+import { CapsuleScreenRect, ThinkingCapsuleManager } from '../../window/ThinkingCapsuleManager';
 import { BrowserManager } from '../../browser/BrowserManager';
 import common from '@ohos.app.ability.common';
 import type Want from '@ohos.app.ability.Want';
@@ -17,12 +19,82 @@ import hilog from '@ohos.hilog';
 
 export class UiTool {
   private static readonly LAYOUT_DUMP_PATH = '/data/local/tmp/sw_ui_layout.json';
+  private static lastActionMsByBundle: Map<string, number> = new Map();
+  private static injectedKnowledgeBundles: Set<string> = new Set();
+
+  private static toOcrRoiBounds(bounds?: UiBounds): OcrRoiBounds | undefined {
+    if (!bounds) {
+      return undefined;
+    }
+    return {
+      left: bounds.left,
+      top: bounds.top,
+      right: bounds.right,
+      bottom: bounds.bottom
+    };
+  }
+
+  private static toOcrExcludeBounds(tree?: UiTreeParseResult): OcrRoiBounds[] {
+    const out: OcrRoiBounds[] = [];
+    if (tree && tree.overlayExcludeBounds && tree.overlayExcludeBounds.length > 0) {
+      for (let i = 0; i < tree.overlayExcludeBounds.length; i++) {
+        const b = tree.overlayExcludeBounds[i];
+        out.push({ left: b.left, top: b.top, right: b.right, bottom: b.bottom });
+      }
+      return out;
+    }
+    const cached = ThinkingCapsuleManager.getInstance().getExcludeBounds();
+    for (let i = 0; i < cached.length; i++) {
+      const c = cached[i];
+      out.push({ left: c.left, top: c.top, right: c.right, bottom: c.bottom });
+    }
+    return out;
+  }
+
+  private static syncOverlayBoundsFromTree(tree: UiTreeParseResult): void {
+    const rects: CapsuleScreenRect[] = [];
+    if (tree.overlayExcludeBounds && tree.overlayExcludeBounds.length > 0) {
+      for (let i = 0; i < tree.overlayExcludeBounds.length; i++) {
+        const b = tree.overlayExcludeBounds[i];
+        rects.push({ left: b.left, top: b.top, right: b.right, bottom: b.bottom });
+      }
+    }
+    ThinkingCapsuleManager.getInstance().updateObservedOverlayBounds(rects);
+  }
+
+  private static async applyAppPace(bundleName?: string): Promise<void> {
+    const target = (bundleName ?? '').trim();
+    if (target.length === 0 || !AppKnowledgeBase.isCarefulApp(target)) {
+      return;
+    }
+    const now = Date.now();
+    const lastMs = UiTool.lastActionMsByBundle.get(target) ?? 0;
+    const minGapMs = 450 + Math.floor(Math.random() * 400);
+    if (lastMs > 0 && now - lastMs < minGapMs) {
+      const waitMs = minGapMs - (now - lastMs);
+      await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+    }
+    UiTool.lastActionMsByBundle.set(target, Date.now());
+  }
+
+  private static maybeBuildAppKnowledgeHint(bundleName?: string): string {
+    const target = (bundleName ?? '').trim();
+    if (target.length === 0 || UiTool.injectedKnowledgeBundles.has(target)) {
+      return '';
+    }
+    const profile = AppKnowledgeBase.findProfile(target);
+    if (!profile) {
+      return '';
+    }
+    UiTool.injectedKnowledgeBundles.add(target);
+    return `\n\n${AppKnowledgeBase.formatCompactHint(profile)}`;
+  }
 
   static getDefinition(): ToolDefinition {
     const props: Record<string, ToolProperty> = {
       'action': new ToolProperty(
         'string',
-        'UI action to perform: "dump_tree", "find_and_click", "click_point", "click_anchor", "input_text", "run_sequence", "ocr", "swipe", "back", "home", "launch_app", "hide_overlay", "show_overlay", or "minimize_overlay".'
+        'UI action to perform: "dump_tree", "find_and_click", "click_point", "click_anchor", "input_text", "run_sequence", "ocr", "swipe", "back", "home", "launch_app", "list_apps", "hide_overlay", "show_overlay", or "minimize_overlay".'
       ),
       'use_ocr': new ToolProperty('boolean', 'For dump_tree or find_and_click: supplement or fallback to on-device CoreVision OCR when elements lack accessibility labels (default false, auto-activates on custom/canvas views).'),
       'ref': new ToolProperty('string', 'Direct element reference tag from dump_tree, e.g. "@4" or "4". Eliminates text ambiguity completely.'),
@@ -36,6 +108,18 @@ export class UiTool {
       'ability_name': new ToolProperty(
         'string',
         'Target UIAbility name for launch_app (default: "EntryAbility").'
+      ),
+      'clone_index': new ToolProperty(
+        'number',
+        'For launch_app when a "选择打开方式" app-clone chooser dialog appears (e.g. 微信 / 微信1): 0-based option index to auto-select (default: 0 = first/main app).'
+      ),
+      'auto_select_clone': new ToolProperty(
+        'boolean',
+        'For launch_app: automatically click clone_index (default 0, first app) if HarmonyOS shows "选择打开方式" dialog (default: true).'
+      ),
+      'split_screen': new ToolProperty(
+        'boolean',
+        'For launch_app: optional split-screen mode (default: false — opens target app full-screen and shows the background Thinking Capsule).'
       ),
       'text': new ToolProperty('string', 'Exact or preferred visible text/hint/description to match (for dump_tree filter, find_and_click, or locating input target).'),
       'contains_text': new ToolProperty('string', 'Case-insensitive substring match against element text/hint/description/id.'),
@@ -93,26 +177,16 @@ export class UiTool {
   private static async dumpAndParse(includeAll: boolean = false, bundleName?: string): Promise<UiTreeParseResult> {
     // Note: Never pass '-b <bundle>' to uitest dumpLayout on HarmonyOS NEXT:
     // In multi-window, split-screen, or floating window modes, uitest dumpLayout -b returns an empty root with 0 children!
-    // Instead, always dump the complete layout and perform rock-solid bundle filtering in memory.
+    // Instead, always dump the complete layout and isolate the target window cleanly in memory.
     const cmd = `uitest dumpLayout -p ${UiTool.LAYOUT_DUMP_PATH} >/dev/null 2>&1 && cat ${UiTool.LAYOUT_DUMP_PATH}`;
     const res = await BridgeController.getInstance().exec(cmd, '', 15);
     if (!res.ok) {
       throw new Error(res.error.length > 0 ? res.error : `uitest dumpLayout failed (exit ${res.exitCode})`);
     }
     const fullTree = UiLayoutParser.extractTree(res.output, includeAll);
-    if (bundleName && bundleName.trim().length > 0) {
-      const targetBundle = bundleName.trim();
-      const filtered = fullTree.nodes.filter(n => n.bundleName === targetBundle || n.bundleName.includes(targetBundle));
-      if (filtered.length > 0) {
-        return {
-          nodes: filtered,
-          totalVisited: fullTree.totalVisited,
-          screenWidth: fullTree.screenWidth,
-          screenHeight: fullTree.screenHeight
-        };
-      }
-    }
-    return fullTree;
+    const filtered = UiLayoutParser.filterToTargetWindow(fullTree, bundleName);
+    UiTool.syncOverlayBoundsFromTree(filtered);
+    return filtered;
   }
 
   private static buildQuery(args: Record<string, Object>): UiNodeQuery {
@@ -137,14 +211,25 @@ export class UiTool {
     } else if (mode === 'long') {
       subCmd = 'longClick';
     }
-    const cmd = (subCmd === 'click')
-      ? `uinput -T -c ${rx} ${ry} >/dev/null 2>&1; uitest uiInput click ${rx} ${ry} >/dev/null 2>&1`
-      : `uitest uiInput ${subCmd} ${rx} ${ry}`;
-    const res = await BridgeController.getInstance().exec(cmd, '', 10);
-    if (!res.ok) {
-      throw new Error(res.error.length > 0 ? res.error : `Command '${cmd}' failed (exit ${res.exitCode})`);
+    const capsule = ThinkingCapsuleManager.getInstance();
+    let hidCapsule = false;
+    if (capsule.pointHitsCapsule(rx, ry, 18)) {
+      hidCapsule = await capsule.temporaryHideForAction('click_collision');
     }
-    return `${subCmd} at (${rx}, ${ry})${res.output.trim().length > 0 ? ': ' + res.output.trim() : ''}`;
+    try {
+      const cmd = (subCmd === 'click')
+        ? `uitest uiInput click ${rx} ${ry} >/dev/null 2>&1 || uinput -T -c ${rx} ${ry} >/dev/null 2>&1`
+        : `uitest uiInput ${subCmd} ${rx} ${ry}`;
+      const res = await BridgeController.getInstance().exec(cmd, '', 10);
+      if (!res.ok) {
+        throw new Error(res.error.length > 0 ? res.error : `Command '${cmd}' failed (exit ${res.exitCode})`);
+      }
+      return `${subCmd} at (${rx}, ${ry})${res.output.trim().length > 0 ? ': ' + res.output.trim() : ''}`;
+    } finally {
+      if (hidCapsule) {
+        capsule.restoreAfterTemporaryHide();
+      }
+    }
   }
 
   static async execute(toolCallId: string, args: Record<string, Object>): Promise<ToolResult> {
@@ -177,6 +262,8 @@ export class UiTool {
           return await UiTool.handleKeyEvent(toolCallId, 'Home', 1);
         case 'launch_app':
           return await UiTool.handleLaunchApp(toolCallId, args);
+        case 'list_apps':
+          return await UiTool.handleListApps(toolCallId, args);
         case 'hide_overlay':
           try {
             await FloatWindowManager.getInstance().hideFloatWindow();
@@ -222,30 +309,40 @@ export class UiTool {
       ? (args['ability_name'] as string).trim()
       : 'EntryAbility';
 
-    // Top-Bottom Split-Screen Launch:
-    // When executing cross-app automation, attempt to open the target app in split screen secondary mode
-    // (WINDOW_MODE_SPLIT_SECONDARY) so Swai remains visible in the top half while the target app is in the bottom half.
-    let splitLaunched = false;
+    const wantSplitScreen = args['split_screen'] === true;
+    const isExternalApp = rawBundle !== 'com.shuwei.shellbridge';
+    if (isExternalApp && !wantSplitScreen) {
+      ThinkingCapsuleManager.getInstance().prepareForExternalApp(rawBundle);
+    }
+
+    let launched = false;
+    let launchModeNote = '';
     const abilityContext = AppStorage.get<common.UIAbilityContext>('abilityContext');
-    if (abilityContext && rawBundle !== 'com.shuwei.shellbridge') {
+    if (abilityContext && isExternalApp) {
       try {
         const want: Want = {
           bundleName: rawBundle,
           abilityName: ability
         };
-        const options: StartOptions = {
-          windowMode: AbilityConstant.WindowMode.WINDOW_MODE_SPLIT_SECONDARY,
-          withAnimation: true
-        };
-        await abilityContext.startAbility(want, options);
-        splitLaunched = true;
-        hilog.info(0x3201, 'UiTool', 'Successfully requested startAbility with WINDOW_MODE_SPLIT_SECONDARY for %{public}s', rawBundle);
+        if (wantSplitScreen) {
+          const options: StartOptions = {
+            windowMode: AbilityConstant.WindowMode.WINDOW_MODE_SPLIT_SECONDARY,
+            withAnimation: true
+          };
+          await abilityContext.startAbility(want, options);
+          launchModeNote = ' in split-screen mode';
+        } else {
+          await abilityContext.startAbility(want);
+          launchModeNote = ' in full-screen mode';
+        }
+        launched = true;
+        hilog.info(0x3201, 'UiTool', 'Successfully started %{public}s%{public}s', rawBundle, launchModeNote);
       } catch (startErr) {
-        hilog.warn(0x3201, 'UiTool', 'startAbility split mode failed: %{public}s, using standard start', JSON.stringify(startErr));
+        hilog.warn(0x3201, 'UiTool', 'startAbility failed: %{public}s, using aa start fallback', JSON.stringify(startErr));
       }
     }
 
-    if (!splitLaunched) {
+    if (!launched) {
       // HarmonyOS standard fallback: aa start -b <bundle> -a <ability> -u 100
       const cmd = `aa start -b ${UiTool.shellSingleQuote(rawBundle)} -a ${UiTool.shellSingleQuote(ability)} -u 100`;
       const res = await BridgeController.getInstance().exec(cmd, '', 15);
@@ -258,11 +355,160 @@ export class UiTool {
       }
     }
 
+    let autoSelectNote = '';
+    const autoSelectClone = args['auto_select_clone'] !== false;
+    if (autoSelectClone && isExternalApp) {
+      const cloneIdx = typeof args['clone_index'] === 'number' && Number.isFinite(args['clone_index'] as number)
+        ? Math.max(0, Math.round(args['clone_index'] as number))
+        : 0;
+      autoSelectNote = await UiTool.tryAutoSelectCloneChooser(rawBundle, cloneIdx);
+    }
+
     const feedback = await UiTool.getPostActionScreenFeedback(rawBundle);
+    const knowledgeHint = UiTool.maybeBuildAppKnowledgeHint(rawBundle);
     return UiTool.ok(
       toolCallId,
-      `Successfully launched application ${rawBundle} (${ability})${splitLaunched ? ' in split-screen mode' : ''}.\n${feedback}`
+      `Successfully launched application ${rawBundle} (${ability})${launchModeNote}${autoSelectNote}.${knowledgeHint}\n${feedback}`
     );
+  }
+
+  private static async tryAutoSelectCloneChooser(targetBundle: string, cloneIndex: number): Promise<string> {
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 550));
+      const cmd = `uitest dumpLayout -p ${UiTool.LAYOUT_DUMP_PATH} >/dev/null 2>&1 && cat ${UiTool.LAYOUT_DUMP_PATH}`;
+      const res = await BridgeController.getInstance().exec(cmd, '', 12);
+      if (!res.ok || !res.output) {
+        return '';
+      }
+      const fullTree = UiLayoutParser.extractTree(res.output, false);
+      const hasChooser = fullTree.nodes.some(n =>
+        n.text === '选择打开方式' || n.id.includes('AppSelectorExtensionAbility')
+      );
+      if (!hasChooser && fullTree.nodes.some(n => n.bundleName === targetBundle)) {
+        return '';
+      }
+      if (!hasChooser) {
+        return '';
+      }
+
+      const chooserNode = fullTree.nodes.find(n => n.text === '选择打开方式') ||
+        fullTree.nodes.find(n => n.id.includes('AppSelectorExtensionAbility'));
+      const sheetWinId = chooserNode ? chooserNode.hostWindowId : '';
+      const minY = Math.round(fullTree.screenHeight * 0.45);
+      const minW = Math.round(fullTree.screenWidth * 0.4);
+
+      const candidates = fullTree.nodes.filter(n => {
+        if (!n.clickable) {
+          return false;
+        }
+        if (sheetWinId.length > 0 && n.hostWindowId !== sheetWinId) {
+          return false;
+        }
+        if (sheetWinId.length === 0 && n.bundleName !== 'com.ohos.sceneboard') {
+          return false;
+        }
+        if (n.bounds.cy < minY || n.bounds.width < minW || n.bounds.height < 80 || n.bounds.height > 420) {
+          return false;
+        }
+        const label = (n.text || n.description).trim();
+        if (label.length === 0 || label === '选择打开方式' || label === '取消' || label === '关闭') {
+          return false;
+        }
+        return n.type === 'Row' || n.type === 'ListItem' || n.type === 'Column' || n.type === 'Flex';
+      });
+
+      if (candidates.length === 0) {
+        return '';
+      }
+
+      candidates.sort((a, b) => a.bounds.top - b.bounds.top);
+      const pickedIdx = Math.max(0, Math.min(cloneIndex, candidates.length - 1));
+      const chosen = candidates[pickedIdx];
+      const chosenLabel = (chosen.text || chosen.description).trim();
+
+      await UiTool.runUiClick(chosen.bounds.cx, chosen.bounds.cy, 'click');
+      await new Promise<void>((resolve) => setTimeout(resolve, 900));
+      hilog.info(0x3201, 'UiTool', 'Auto-selected clone option #%{public}d "%{public}s" for %{public}s', pickedIdx + 1, chosenLabel, targetBundle);
+      return ` (auto-selected #${pickedIdx + 1} "${chosenLabel}" in 选择打开方式)`;
+    } catch (e) {
+      hilog.warn(0x3201, 'UiTool', 'tryAutoSelectCloneChooser failed: %{public}s', `${e}`);
+      return '';
+    }
+  }
+
+  private static async handleListApps(toolCallId: string, args: Record<string, Object>): Promise<ToolResult> {
+    const queryText = (typeof args['text'] === 'string'
+      ? (args['text'] as string)
+      : (typeof args['contains_text'] === 'string' ? (args['contains_text'] as string) : '')).trim().toLowerCase();
+
+    const res = await BridgeController.getInstance().exec('bm dump -a', '', 15);
+    if (!res.ok) {
+      return UiTool.fail(toolCallId, res.error.length > 0 ? res.error : `bm dump -a failed (exit ${res.exitCode})`, res.output);
+    }
+
+    const bundles: string[] = [];
+    const lines = (res.output || '').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const candidate = lines[i].trim();
+      if (candidate.length === 0 || candidate.endsWith(':') || candidate.includes(' ')) {
+        continue;
+      }
+      if (queryText.length > 0 && !candidate.toLowerCase().includes(queryText)) {
+        continue;
+      }
+      if (!bundles.includes(candidate)) {
+        bundles.push(candidate);
+      }
+    }
+
+    if (bundles.length === 0) {
+      return UiTool.ok(
+        toolCallId,
+        queryText.length > 0
+          ? `No installed HarmonyOS bundle matched "${queryText}".`
+          : 'No installed bundles returned by bm dump -a.'
+      );
+    }
+
+    const cap = Math.min(bundles.length, 40);
+    const outLines: string[] = [`Installed HarmonyOS Bundles (${bundles.length} matched${queryText ? ` for "${queryText}"` : ''}):`];
+
+    // Resolve mainAbility automatically when narrowed down to a small set (<= 5)
+    if (cap <= 5) {
+      for (let i = 0; i < cap; i++) {
+        const b = bundles[i];
+        let abilityInfo = '';
+        try {
+          const abRes = await BridgeController.getInstance().exec(
+            `bm dump -n ${UiTool.shellSingleQuote(b)} | grep -o '"mainAbility":"[^"]\\+"' | head -n 1`,
+            '',
+            8
+          );
+          if (abRes.ok && abRes.output) {
+            const m = abRes.output.match(/"mainAbility":"([^"]+)"/);
+            if (m && m[1]) {
+              abilityInfo = ` (mainAbility=${m[1]})`;
+            }
+          }
+        } catch (_e) {
+          // ignore
+        }
+        const profile = AppKnowledgeBase.findProfile(b);
+        const aliasTag = profile ? ` [${profile.displayName}]` : '';
+        outLines.push(`- ${b}${abilityInfo}${aliasTag}`);
+      }
+    } else {
+      for (let i = 0; i < cap; i++) {
+        const b = bundles[i];
+        const profile = AppKnowledgeBase.findProfile(b);
+        outLines.push(`- ${b}${profile ? ` [${profile.displayName}]` : ''}`);
+      }
+      if (bundles.length > cap) {
+        outLines.push(`... (+${bundles.length - cap} more bundles; pass contains_text to narrow down and inspect mainAbility)`);
+      }
+    }
+
+    return UiTool.ok(toolCallId, outLines.join('\n'));
   }
 
   private static async handleDumpTree(toolCallId: string, args: Record<string, Object>): Promise<ToolResult> {
@@ -275,9 +521,17 @@ export class UiTool {
     const matched = UiLayoutParser.filterNodes(tree.nodes, query);
     let summary = UiLayoutParser.formatSummary(tree, matched, limit);
 
-    if (args['use_ocr'] === true || (matched.length < 3 && args['text'] === undefined && args['contains_text'] === undefined)) {
+    const targetBundle = tree.activeBundle || bundleName;
+    summary += UiTool.maybeBuildAppKnowledgeHint(targetBundle);
+
+    if (args['use_ocr'] === true ||
+      tree.treeQuality !== 'full' ||
+      (matched.length < 3 && args['text'] === undefined && args['contains_text'] === undefined)) {
       try {
-        const ocrRes = await PhoneOcr.recognizeScreen();
+        const ocrRes = await PhoneOcr.recognizeScreen(
+          UiTool.toOcrRoiBounds(tree.activeWindowBounds),
+          UiTool.toOcrExcludeBounds(tree)
+        );
         if (ocrRes.ok && ocrRes.lines.length > 0) {
           summary += `\n\n${PhoneOcr.formatSummary(ocrRes, 30)}`;
         }
@@ -350,7 +604,10 @@ export class UiTool {
           description: '搜索',
           id: '',
           type: 'VisualAnchor',
-          bundleName: 'com.tencent.wechat',
+          bundleName: tree.activeBundle || '',
+          abilityName: '',
+          pagePath: tree.activePagePath || '',
+          hostWindowId: '',
           bounds: {
             left: resolved.x - 40,
             top: resolved.y - 40,
@@ -366,6 +623,10 @@ export class UiTool {
           scrollable: false,
           enabled: true,
           visible: true,
+          focused: false,
+          selected: false,
+          checked: false,
+          longClickable: false,
           depth: 5
         };
       }
@@ -384,7 +645,10 @@ export class UiTool {
           description: '返回',
           id: '',
           type: 'VisualAnchor',
-          bundleName: 'com.tencent.wechat',
+          bundleName: tree.activeBundle || '',
+          abilityName: '',
+          pagePath: tree.activePagePath || '',
+          hostWindowId: '',
           bounds: {
             left: resolved.x - 40,
             top: resolved.y - 40,
@@ -400,6 +664,10 @@ export class UiTool {
           scrollable: false,
           enabled: true,
           visible: true,
+          focused: false,
+          selected: false,
+          checked: false,
+          longClickable: false,
           depth: 5
         };
       }
@@ -436,13 +704,17 @@ export class UiTool {
       const queryText = (query.text || query.containsText || '').trim().toLowerCase();
       if (queryText.length > 0) {
         try {
-          const ocrRes = await PhoneOcr.recognizeScreen();
+          const ocrRes = await PhoneOcr.recognizeScreen(
+          UiTool.toOcrRoiBounds(tree.activeWindowBounds),
+          UiTool.toOcrExcludeBounds(tree)
+        );
           if (ocrRes.ok && ocrRes.lines.length > 0) {
             const matchedLine = ocrRes.lines.find(l => l.text.toLowerCase().includes(queryText));
             if (matchedLine) {
+              await UiTool.applyAppPace(tree.activeBundle || bundleName);
               const mode = typeof args['click_mode'] === 'string' ? args['click_mode'] as string : 'click';
               const clickMsg = await UiTool.runUiClick(matchedLine.cx, matchedLine.cy, mode);
-              const feedback = await UiTool.getPostActionScreenFeedback(bundleName, tree);
+              const feedback = await UiTool.getPostActionScreenFeedback(tree.activeBundle || bundleName, tree);
               return UiTool.ok(
                 toolCallId,
                 `[CoreVision OCR Match] Clicked text "${matchedLine.text}" at (${matchedLine.cx}, ${matchedLine.cy}) bounds=[${matchedLine.left},${matchedLine.top}][${matchedLine.right},${matchedLine.bottom}] -> ${clickMsg}${feedback}`
@@ -466,6 +738,7 @@ export class UiTool {
       );
     }
 
+    await UiTool.applyAppPace(target.bundleName || tree.activeBundle || bundleName);
     const mode = typeof args['click_mode'] === 'string' ? args['click_mode'] as string : 'click';
     const isSendAction = target.text === '发送' || target.description === '发送';
     const clickMsg = await UiTool.runUiClick(target.bounds.cx, target.bounds.cy, mode);
@@ -475,7 +748,7 @@ export class UiTool {
       // Ensures the message commits even if accessibility focus was held by the virtual keyboard
       try {
         await BridgeController.getInstance().exec(
-          `uinput -T -c ${target.bounds.cx} ${target.bounds.cy} >/dev/null 2>&1; uitest uiInput keyEvent 2054 >/dev/null 2>&1`,
+          `uitest uiInput click ${target.bounds.cx} ${target.bounds.cy} >/dev/null 2>&1; uitest uiInput keyEvent 2054 >/dev/null 2>&1`,
           '',
           5
         );
@@ -484,7 +757,7 @@ export class UiTool {
       }
     }
 
-    const feedback = await UiTool.getPostActionScreenFeedback(bundleName, tree);
+    const feedback = await UiTool.getPostActionScreenFeedback(target.bundleName || tree.activeBundle || bundleName, tree);
     return UiTool.ok(
       toolCallId,
       `Clicked matched node -> ${clickMsg}\nElement: ${UiLayoutParser.formatNodeLine(target)}${feedback}`
@@ -498,10 +771,11 @@ export class UiTool {
     }
     const bundleName = typeof args['bundle_name'] === 'string' ? (args['bundle_name'] as string).trim() : undefined;
     const tree = await UiTool.dumpAndParse(false, bundleName);
-    const resolved = VisualAffordanceEngine.resolveAnchor(tree, anchor, bundleName);
+    const resolved = VisualAffordanceEngine.resolveAnchor(tree, anchor, tree.activeBundle || bundleName);
     if (!resolved) {
       return UiTool.fail(toolCallId, `Unable to resolve visual anchor "${anchor}" on current screen.`);
     }
+    await UiTool.applyAppPace(tree.activeBundle || bundleName);
     const mode = typeof args['click_mode'] === 'string' ? args['click_mode'] as string : 'click';
     const clickMsg = await UiTool.runUiClick(resolved.x, resolved.y, mode);
     if (anchor.includes('send') || anchor.includes('发送')) {
@@ -511,7 +785,7 @@ export class UiTool {
         // ignore
       }
     }
-    const feedback = await UiTool.getPostActionScreenFeedback(bundleName, tree);
+    const feedback = await UiTool.getPostActionScreenFeedback(tree.activeBundle || bundleName, tree);
     return UiTool.ok(toolCallId, `[Visual Affordance] ${resolved.label} -> ${clickMsg}${feedback}`);
   }
 
@@ -528,9 +802,11 @@ export class UiTool {
     } catch (_e) {
       // ignore
     }
+    const activePkg = (beforeTree && beforeTree.activeBundle) ? beforeTree.activeBundle : bundleName;
+    await UiTool.applyAppPace(activePkg);
     const mode = typeof args['click_mode'] === 'string' ? args['click_mode'] as string : 'click';
     const clickMsg = await UiTool.runUiClick(x, y, mode);
-    const feedback = await UiTool.getPostActionScreenFeedback(bundleName, beforeTree);
+    const feedback = await UiTool.getPostActionScreenFeedback(activePkg, beforeTree);
     return UiTool.ok(toolCallId, `${clickMsg}${feedback}`);
   }
 
@@ -635,19 +911,21 @@ export class UiTool {
       }
     }
 
+    const activePkg = (beforeTree && beforeTree.activeBundle) ? beforeTree.activeBundle : bundleName;
+    await UiTool.applyAppPace(activePkg);
+
     const clearFirst = args['clear_first'] !== false;
     if (clearFirst && targetX !== undefined && targetY !== undefined) {
       try {
         // Focus the input field first
         await UiTool.runUiClick(targetX, targetY, 'click');
         await new Promise<void>((resolve) => setTimeout(resolve, 150));
-        // Clear any existing text drafts: Ctrl+A then Delete, plus fallback backspace burst
+        // Clear existing draft via Ctrl+A then Backspace
         const clearCmd =
           `uitest uiInput keyEvent 2072 2017 >/dev/null 2>&1; ` +
-          `uitest uiInput keyEvent 2055 >/dev/null 2>&1; ` +
-          `for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do uitest uiInput keyEvent 2055 >/dev/null 2>&1; done`;
+          `uitest uiInput keyEvent 2055 >/dev/null 2>&1`;
         await BridgeController.getInstance().exec(clearCmd, '', 5);
-        await new Promise<void>((resolve) => setTimeout(resolve, 150));
+        await new Promise<void>((resolve) => setTimeout(resolve, 120));
       } catch (_e) {
         // ignore
       }
@@ -742,12 +1020,13 @@ export class UiTool {
       dirLabel = ` (${direction} on ${w}x${h})`;
     }
 
+    const bundleName = typeof args['bundle_name'] === 'string' ? (args['bundle_name'] as string).trim() : undefined;
+    await UiTool.applyAppPace(bundleName);
     const cmd = `uinput -T -m ${x1} ${y1} ${x2} ${y2} ${durationMs}`;
     const res = await BridgeController.getInstance().exec(cmd, '', 10);
     if (!res.ok) {
       return UiTool.fail(toolCallId, res.error.length > 0 ? res.error : `Swipe failed (exit ${res.exitCode})`, res.output);
     }
-    const bundleName = typeof args['bundle_name'] === 'string' ? (args['bundle_name'] as string).trim() : undefined;
     const feedback = await UiTool.getPostActionScreenFeedback(bundleName);
     return UiTool.ok(toolCallId, `Swiped (${x1},${y1}) -> (${x2},${y2}) in ${durationMs}ms${dirLabel}${feedback}`);
   }
@@ -792,23 +1071,17 @@ export class UiTool {
       }
     }
 
-    let beforeBundle = '';
-    for (let i = 0; i < before.nodes.length; i++) {
-      if (before.nodes[i].bundleName.length > 0) {
-        beforeBundle = before.nodes[i].bundleName;
-        break;
-      }
-    }
-    let afterBundle = '';
-    for (let i = 0; i < after.nodes.length; i++) {
-      if (after.nodes[i].bundleName.length > 0) {
-        afterBundle = after.nodes[i].bundleName;
-        break;
-      }
-    }
+    const beforeBundle = before.activeBundle || '';
+    const afterBundle = after.activeBundle || '';
 
     if (beforeBundle.length > 0 && afterBundle.length > 0 && beforeBundle !== afterBundle) {
       return `[ACTION EFFECT]: APP_SWITCHED (${beforeBundle} -> ${afterBundle})`;
+    }
+
+    const beforePage = before.activePagePath || '';
+    const afterPage = after.activePagePath || '';
+    if (beforePage.length > 0 && afterPage.length > 0 && beforePage !== afterPage) {
+      return `[ACTION EFFECT]: PAGE_CHANGED (${beforePage} -> ${afterPage})`;
     }
 
     const beforeCount = before.nodes.length;
@@ -848,7 +1121,7 @@ export class UiTool {
       const nodesToDisplay = interactiveNodes.length > 0 ? interactiveNodes : tree.nodes;
       const summary = UiLayoutParser.formatSummary(tree, nodesToDisplay, 25);
       const effect = beforeTree ? `\n\n${UiTool.computeActionEffect(beforeTree, tree)}` : '';
-      return `${effect}\n\n[新界面实时状态感知 / Post-Action Screen State]:\n${summary}\n\n[动态任务清单调节闭环 / Dynamic Replanning Instruction]:\n动作已执行，屏幕已发生最新变化！请严格按以下步骤推进：\n1. 🎯 [终极目标锚点不变]：确认初始目标保持不变，绝不因中间状态或临时子页面改变目标！\n2. 📱 [核对当前真实状态]：对比上方最新节点与 [ACTION EFFECT]，判断上一步是否达到预期？若显示 NO_EFFECT，立即更换策略！\n3. 📋 [动态调节任务清单]：\n   - 若遇到阻碍（如文字拼接、弹窗），立即动态插入 [!] 补救子任务（例如调用 input_text 自动清空重输，或点击主实例），再收敛回主目标；\n   - 若顺利推进，标记 [x] 完成并推进到下一步 [ ]；\n4. ⚡ [执行下一步动作]：可继续单步推进，或调用 run_sequence 批量一键完成后续确定的动作链！`;
+      return `${effect}\n\n[Post-Action Screen State]:\n${summary}\n\n[Next Step]: 核对 App/Page/TreeQuality 与上方 [ACTION EFFECT]；若出现 NO_EFFECT，勿盲目重复点击同一坐标，可改用 @ref、click_anchor、ocr 或滑动后重试。`;
     } catch (_err) {
       return '';
     }
@@ -911,7 +1184,17 @@ export class UiTool {
               stopReason = `Step ${i + 1} (launch) failed: missing bundle_name`;
               break;
             }
-            await UiTool.handleLaunchApp(toolCallId, { 'bundle_name': pkg, 'ability_name': step['ability_name'] || 'EntryAbility' });
+            const launchArgs: Record<string, Object> = {
+              'bundle_name': pkg,
+              'ability_name': step['ability_name'] || 'EntryAbility'
+            };
+            if (typeof step['clone_index'] === 'number') {
+              launchArgs['clone_index'] = step['clone_index'];
+            }
+            if (typeof step['auto_select_clone'] === 'boolean') {
+              launchArgs['auto_select_clone'] = step['auto_select_clone'];
+            }
+            await UiTool.handleLaunchApp(toolCallId, launchArgs);
             executedSteps.push(`[${i + 1}] launch(${pkg}) -> OK`);
             break;
           }
@@ -934,9 +1217,12 @@ export class UiTool {
               clickY = targetNode.bounds.cy;
               tapLabel = targetNode.text || targetNode.description || targetNode.type;
             } else if (step['target']) {
-              // OCR Fallback in run_sequence pipeline
+              // OCR Fallback in run_sequence pipeline (cropped to active window ROI)
               const targetText = String(step['target']).trim().toLowerCase();
-              const ocrRes = await PhoneOcr.recognizeScreen();
+              const ocrRes = await PhoneOcr.recognizeScreen(
+                UiTool.toOcrRoiBounds(currentTree.activeWindowBounds),
+                UiTool.toOcrExcludeBounds(currentTree)
+              );
               if (ocrRes.ok) {
                 const matchedLine = ocrRes.lines.find(l => l.text.toLowerCase().includes(targetText));
                 if (matchedLine) {
@@ -950,6 +1236,7 @@ export class UiTool {
               stopReason = `Step ${i + 1} (tap) halted: target node '${step['target'] || step['ref'] || 'unknown'}' not found by tree or OCR.`;
               break;
             }
+            await UiTool.applyAppPace(currentTree.activeBundle || bundleName);
             await UiTool.runUiClick(clickX, clickY, 'click');
             executedSteps.push(`[${i + 1}] tap('${tapLabel}' @(${clickX},${clickY})) -> OK`);
             break;
@@ -957,11 +1244,12 @@ export class UiTool {
           case 'click_anchor': {
             const anchor = typeof step['anchor'] === 'string' ? (step['anchor'] as string).trim() : '';
             const currentTree = await UiTool.dumpAndParse(false, bundleName);
-            const resolved = VisualAffordanceEngine.resolveAnchor(currentTree, anchor, bundleName);
+            const resolved = VisualAffordanceEngine.resolveAnchor(currentTree, anchor, currentTree.activeBundle || bundleName);
             if (!resolved) {
               stopReason = `Step ${i + 1} (click_anchor) halted: anchor '${anchor}' could not be resolved.`;
               break;
             }
+            await UiTool.applyAppPace(currentTree.activeBundle || bundleName);
             await UiTool.runUiClick(resolved.x, resolved.y, 'click');
             executedSteps.push(`[${i + 1}] click_anchor('${anchor}' @(${resolved.x},${resolved.y})) -> OK`);
             break;
@@ -1077,7 +1365,17 @@ export class UiTool {
   private static async handleOcr(toolCallId: string, args: Record<string, Object>): Promise<ToolResult> {
     const rawLimit = typeof args['limit'] === 'number' ? Math.round(args['limit'] as number) : 60;
     const limit = Math.max(1, Math.min(200, rawLimit));
-    const result = await PhoneOcr.recognizeScreen();
+    const bundleName = typeof args['bundle_name'] === 'string' ? (args['bundle_name'] as string).trim() : undefined;
+    let roiBounds: OcrRoiBounds | undefined = undefined;
+    let excludeBounds = UiTool.toOcrExcludeBounds(undefined);
+    try {
+      const tree = await UiTool.dumpAndParse(false, bundleName);
+      roiBounds = UiTool.toOcrRoiBounds(tree.activeWindowBounds);
+      excludeBounds = UiTool.toOcrExcludeBounds(tree);
+    } catch (_e) {
+      // Fall back to full-screen OCR if dumpLayout is unavailable
+    }
+    const result = await PhoneOcr.recognizeScreen(roiBounds, excludeBounds);
     if (!result.ok) {
       return UiTool.fail(toolCallId, result.error ?? 'CoreVision OCR recognition failed');
     }

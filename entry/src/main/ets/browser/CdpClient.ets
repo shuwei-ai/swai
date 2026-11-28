@@ -78,28 +78,46 @@ export class CdpClient {
   }
 
   /**
-   * Connect to the first page target on the given DevTools port
+   * Connect to the first non-excluded page target on the given DevTools port.
+   * Excludes protected origins (such as the host DSH chat WebView) so CDP never
+   * hijacks the agent's own UI window.
    */
-  public async connect(port: number = 9222): Promise<boolean> {
+  public async connect(port: number = 9222, excludeUrlPrefixes: string[] = []): Promise<boolean> {
     if (this.isConnected) {
       return true;
     }
 
     const targets = await this.discoverTargets(port);
+    const isExcluded = (target: CdpTarget): boolean => {
+      const url = (target.url || '').trim();
+      for (let j = 0; j < excludeUrlPrefixes.length; j++) {
+        const prefix = excludeUrlPrefixes[j];
+        if (prefix && url.startsWith(prefix)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
     let pageTarget: CdpTarget | undefined = undefined;
     for (let i = 0; i < targets.length; i++) {
-      if (targets[i].type === 'page' && targets[i].webSocketDebuggerUrl) {
+      if (targets[i].type === 'page' && targets[i].webSocketDebuggerUrl && !isExcluded(targets[i])) {
         pageTarget = targets[i];
         break;
       }
     }
 
-    if (!pageTarget && targets.length > 0 && targets[0].webSocketDebuggerUrl) {
-      pageTarget = targets[0];
+    if (!pageTarget) {
+      for (let i = 0; i < targets.length; i++) {
+        if (targets[i].webSocketDebuggerUrl && !isExcluded(targets[i])) {
+          pageTarget = targets[i];
+          break;
+        }
+      }
     }
 
     if (!pageTarget || !pageTarget.webSocketDebuggerUrl) {
-      hilog.warn(DOMAIN, TAG, 'no connectable CDP target found on port %{public}d', port);
+      hilog.warn(DOMAIN, TAG, 'no non-excluded connectable CDP target found on port %{public}d (total=%{public}d)', port, targets.length);
       return false;
     }
 

@@ -67,7 +67,7 @@ export const DEFAULT_LESSONS: MemoryLesson[] = [
   {
     id: 'lesson_browser_cdp_loopback',
     category: 'tools',
-    rule: 'browser 工具基于本机的 ArkWeb 与 CDP 127.0.0.1:9222 环回连接。网页交互使用 index 针对编号元素操作（如 click index=1 或 type index=2 text="hello"）。',
+    rule: 'browser 工具基于本机的 ArkWeb 与 CDP 127.0.0.1:9222 环回连接。网页交互使用 index 针对编号元素操作（如 click index=1 或 type index=2 text="hello"）。注意：9222 端口是进程全局的，包含宿主 DSH 对话窗口本身，严禁通过脚本直连 CDP 修改或覆盖 DSH 对话所在的 target（必须跳过 DSH 端口对应的 target，仅操作独立浏览器 target）。',
     triggerPattern: 'browser|CDP|9222',
     occurrenceCount: 2,
     confidence: 0.9,

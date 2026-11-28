@@ -23,6 +23,7 @@ import { BrowserView } from './BrowserView';
 export struct BrowserFloatingPip {
   @State private pipMode: PipMode = PipMode.HIDDEN;
   @State private glowStatus: PipGlowStatus = PipGlowStatus.NORMAL;
+  @State private hasActivated: boolean = false;
 
   // Window coordinates (in vp)
   @State private posX: number = 210;
@@ -78,6 +79,9 @@ export struct BrowserFloatingPip {
   private syncState(): void {
     this.pipMode = this.pipState.mode;
     this.glowStatus = this.pipState.glowStatus;
+    if (this.pipMode !== PipMode.HIDDEN && !this.hasActivated) {
+      this.hasActivated = true;
+    }
 
     if (this.glowStatus === PipGlowStatus.ATTENTION) {
       this.startBreathingGlow();
@@ -148,8 +152,9 @@ export struct BrowserFloatingPip {
   }
 
   build() {
-    Column() {
-      // 1. Pip Header (Drag Handle & Controls)
+    if (this.hasActivated) {
+      Column() {
+        // 1. Pip Header (Drag Handle & Controls)
       Row() {
         // Drag indicator and page icon
         Row({ space: 5 }) {
@@ -306,5 +311,6 @@ export struct BrowserFloatingPip {
     })
     .opacity(this.pipMode !== PipMode.HIDDEN ? 1 : 0.001)
     .hitTestBehavior(this.pipMode !== PipMode.HIDDEN ? HitTestMode.Default : HitTestMode.None)
+    }
   }
 }

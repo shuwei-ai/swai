@@ -80,7 +80,6 @@ export class BridgeController {
       this.debugSnapshot.lastError = this.lastError;
       this.debugSnapshot.phase = 'not_enabled';
     } else {
-      this.debugSnapshot.publicKey = publicKeyNative();
       this.loadPersistedTarget(context).catch(() => {});
     }
     return ok;

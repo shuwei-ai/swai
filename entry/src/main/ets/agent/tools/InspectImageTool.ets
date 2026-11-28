@@ -15,6 +15,7 @@ import {
   ToolResult
 } from '../types';
 import { ImageEncoder } from '../utils/ImageEncoder';
+import { ThinkingCapsuleManager } from '../../window/ThinkingCapsuleManager';
 
 const DEFAULT_SCREENSHOT_PATH = '/data/local/tmp/_agent_view.jpeg';
 
@@ -68,7 +69,11 @@ export class InspectImageTool {
             : `(uitest screenCap -p '${escaped}' >/dev/null 2>&1 || (snapshot_display -f /data/local/tmp/_snap_tmp.jpeg >/dev/null 2>&1 && mv /data/local/tmp/_snap_tmp.jpeg '${escaped}'))`) +
           ` && [ -s '${escaped}' ]`;
 
-        const snapRes = await BridgeController.getInstance().exec(snapCmd, '', 15);
+        const hidCapsule = await ThinkingCapsuleManager.getInstance().temporaryHideForAction('inspect_image');
+        let snapRes = await BridgeController.getInstance().exec(snapCmd, '', 15);
+        if (hidCapsule) {
+          ThinkingCapsuleManager.getInstance().restoreAfterTemporaryHide();
+        }
         if (!snapRes.ok) {
           const checkRes = await BridgeController.getInstance().exec(`ls -la '${escaped}' 2>&1`);
           return {

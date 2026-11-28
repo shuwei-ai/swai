@@ -9,6 +9,7 @@
     ],
     "deliveryWithInstall": true,
     "installationFree": false,
+    "extractNativeLibs": true,
     "pages": "$profile:main_pages",
     "requestPermissions": [
       {
@@ -19,6 +20,36 @@
       },
       {
         "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
+      },
+      {
+        "name": "ohos.permission.LOCATION",
+        "reason": "$string:permission_location_desc",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
+      },
+      {
+        "name": "ohos.permission.APPROXIMATELY_LOCATION",
+        "reason": "$string:permission_location_desc",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
+      },
+      {
+        "name": "ohos.permission.LOCATION_IN_BACKGROUND",
+        "reason": "$string:permission_bg_location_desc",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
       },
       {
         "name": "ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY",
@@ -63,6 +94,11 @@
           "fullscreen",
           "split",
           "floating"
+        ],
+        "backgroundModes": [
+          "location",
+          "dataTransfer",
+          "taskKeeping"
         ],
         "exported": true,
         "skills": [

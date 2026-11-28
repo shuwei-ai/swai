@@ -73,8 +73,8 @@ export class BrowserManager {
   public controller: webview.WebviewController = new webview.WebviewController();
   public cdpClient: CdpClient = new CdpClient();
 
-  public currentUrl: string = 'https://developer.huawei.com';
-  public currentTitle: string = 'HarmonyOS Developer';
+  public currentUrl: string = 'about:blank';
+  public currentTitle: string = '浏览器';
   public isLoading: boolean = false;
   public loadProgress: number = 0;
   public canGoBack: boolean = false;
@@ -85,8 +85,15 @@ export class BrowserManager {
 
   private pageLoadDeferred: ((ok: boolean) => void) | null = null;
   private isInitialized: boolean = false;
+  private protectedDshPort: number = 0;
   private controllerAttachedResolvers: Array<() => void> = [];
   private showOverlayListeners: Array<() => void> = [];
+
+  public setProtectedDshPort(port: number): void {
+    if (port > 0) {
+      this.protectedDshPort = port;
+    }
+  }
 
   public onShowOverlay(listener: () => void): () => void {
     this.showOverlayListeners.push(listener);
@@ -128,9 +135,11 @@ export class BrowserManager {
   }
 
   public async ensureControllerAttached(timeoutMs: number = 6000): Promise<boolean> {
+    this.init(this.cdpPort);
     if (this.isControllerAttached) {
       return true;
     }
+    this.requestShowOverlay();
     return new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => {
         hilog.warn(DOMAIN, TAG, 'Timed out waiting for WebviewController to associate with Web component (%{public}dms)', timeoutMs);
@@ -176,7 +185,12 @@ export class BrowserManager {
       return true;
     }
     try {
-      const ok = await this.cdpClient.connect(this.cdpPort);
+      const excludePrefixes: string[] = [];
+      if (this.protectedDshPort > 0) {
+        excludePrefixes.push(`http://127.0.0.1:${this.protectedDshPort}`);
+        excludePrefixes.push(`http://localhost:${this.protectedDshPort}`);
+      }
+      const ok = await this.cdpClient.connect(this.cdpPort, excludePrefixes);
       this.cdpConnected = ok;
       if (ok) {
         try {

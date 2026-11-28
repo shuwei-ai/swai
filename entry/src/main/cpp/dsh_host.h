@@ -37,6 +37,7 @@ struct ParsedToolHttpBody {
 };
 
 bool ParseToolHttpBodyJson(const std::string& body, ParsedToolHttpBody& out);
+bool ParseHostReadyBodyJson(const std::string& body, int& port, std::string& base_url, std::string& token);
 int ComputePollTimeoutMs(int64_t deadline_ms, int64_t now_epoch_ms);
 
 class DshHost {

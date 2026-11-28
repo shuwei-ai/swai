@@ -1,8 +1,8 @@
 /*
  * AppKnowledgeBase provides structured application knowledge profiles for popular HarmonyOS NEXT apps.
- * Inspired by Mika's knowledge base architecture (e.g. knowledge/apps/{app}/APP.md).
- * Contains package names, UI structure quirks (e.g. RichEditor vs TextInput), navigation traps,
- * and high-efficiency fast-path execution sequence recipes.
+ * Calibrated from live HarmonyOS NEXT device inspection and Mika's APP.md architecture.
+ * Contains verified HarmonyOS bundle names, entry abilities, pagePath cues, UI structure quirks,
+ * risk pacing metadata, and parameterized run_sequence recipes.
  */
 
 export interface RecipeStep {
@@ -17,8 +17,11 @@ export interface RecipeStep {
 export interface AppProfile {
   bundleName: string;
   displayName: string;
+  mainAbility: string;
+  pace: 'normal' | 'careful';
   aliases: string[];
   description: string;
+  knownPages: Record<string, string>;
   uiQuirks: string[];
   fastRecipes: Record<string, RecipeStep[]>;
 }
@@ -30,6 +33,11 @@ const WECHAT_SEND_RECIPE: RecipeStep[] = [
   { op: 'tap', target: '{CONTACT}' },
   { op: 'click_anchor', anchor: 'chat_input' },
   { op: 'type', text: '{MESSAGE}', auto_send: true }
+];
+
+const WECHAT_SWITCH_TAB_RECIPE: RecipeStep[] = [
+  { op: 'launch', bundle_name: 'com.tencent.wechat' },
+  { op: 'tap', target: '{TAB_NAME}' }
 ];
 
 const NOTEPAD_CREATE_RECIPE: RecipeStep[] = [
@@ -47,21 +55,81 @@ const SETTINGS_SEARCH_RECIPE: RecipeStep[] = [
 export class AppKnowledgeBase {
   private static getWechatProfile(): AppProfile {
     const recipes: Record<string, RecipeStep[]> = {
-      'send_message': WECHAT_SEND_RECIPE
+      'send_message': WECHAT_SEND_RECIPE,
+      'switch_tab': WECHAT_SWITCH_TAB_RECIPE
+    };
+    const pages: Record<string, string> = {
+      'pages/WechatAppPage': '微信主框架（包含 微信/通讯录/发现/我 底部四标签与顶部标题栏 WeTopNavigationBarCenterTitle）'
     };
     return {
       bundleName: 'com.tencent.wechat',
       displayName: '微信 (HarmonyOS NEXT)',
+      mainAbility: 'EntryAbility',
+      pace: 'careful',
       aliases: ['微信', 'wechat', 'wx'],
-      description: '腾讯微信 HarmonyOS NEXT 原生版。主要界面包括聊天列表、通讯录、发现、我。',
+      description: '腾讯微信 HarmonyOS NEXT 原生版。主要结构为 微信 / 通讯录 / 发现 / 我 四个标签页。',
+      knownPages: pages,
       uiQuirks: [
-        '【关键】微信聊天输入框是 ArkUI RichEditor 组件，未聚焦前在普通 TextInput 过滤中可能不可见。请直接调用 action: "click_anchor", anchor: "chat_input" 或在 run_sequence 中使用该锚点聚焦。',
-        '【关键】微信右上角搜索图标无 text/description 标签。请直接调用 action: "click_anchor", anchor: "search" 即可精准点击。',
-        '【语音切换】若输入框显示为“按住 说话”，说明处于语音输入模式。点击左侧语音/键盘切换图标（anchor: "voice_toggle"）切回键盘输入。',
-        '【一键发送】输入文字后右下角会弹出绿色“发送”按钮。调用 input_text 时指定 auto_send: true 或在 run_sequence 中使用 type 并设 auto_send: true，可直接一步完成输入加点击发送！',
-        '【搜索联系人防误触】在搜索结果中点击联系人时，优先使用 @ref 索引或 target 明确指定联系人昵称，避免误点到搜索输入框本身。'
+        '【应用分身弹窗】当手机开启微信分身（微信 / 微信1）并弹出「选择打开方式」时，launch_app 默认会自动点击第 1 项（clone_index=0 即主微信）；仅当用户明确要求打开“微信1/分身”时传 clone_index=1。若在后续界面意外见到该弹窗，直接点击第 1 项 Row（text="微信", index=0）即可，不要因此停下询问。',
+        '【顶部图标与搜索】顶部导航栏标题文本在 id="WeTopNavigationBarCenterTitle_..." 中；右上角搜索放大镜与“+”多为 SymbolGlyph/Image 无文本节点，用 click_anchor(anchor="search") 或坐标盲区匹配。',
+        '【聊天输入框与语音态】聊天输入框通常为 RichEditor，未聚焦前在纯 TextInput 过滤中可能不可见；若出现「按住 说话」，先点 click_anchor(anchor="voice_toggle") 切回键盘再输入；输入时可用 input_text(..., auto_send=true) 一步发送。',
+        '【自绘/无标签列表】部分会话/消息区域若出现 TreeQuality: sparse/empty 或缺少文字标签，立即切换 ui(action="ocr")（已自动裁剪微信窗口区域）或 capture_screen。',
+        '【搜索防误触】搜索结果页点击联系人时优先用 @ref 或明确 target，避免误点回顶部搜索框本身。'
       ],
       fastRecipes: recipes
+    };
+  }
+
+  private static getXhsProfile(): AppProfile {
+    return {
+      bundleName: 'com.xingin.xhs_hos',
+      displayName: '小红书 (HarmonyOS NEXT)',
+      mainAbility: 'EntryAbility',
+      pace: 'careful',
+      aliases: ['小红书', 'xhs', 'xiaohongshu'],
+      description: '小红书鸿蒙原生版，包含发现/关注/购物/消息/我与图文笔记搜索流。',
+      knownPages: {},
+      uiQuirks: [
+        '【风控节流】高频翻页或连续点开详情易触发滑动验证码，操作需留有停顿，遇验证界面立即交由用户处理。',
+        '【搜索与双列卡片】首页顶部搜索入口与笔记卡片多为复合可点击容器，优先按 @ref、文本或 OCR 定位标题后点击。'
+      ],
+      fastRecipes: {}
+    };
+  }
+
+  private static getFeishuProfile(): AppProfile {
+    const pages: Record<string, string> = {
+      'entry/RootPage': '飞书主界面'
+    };
+    return {
+      bundleName: 'com.ss.feishu',
+      displayName: '飞书 (HarmonyOS NEXT)',
+      mainAbility: 'EntryAbility',
+      pace: 'normal',
+      aliases: ['飞书', 'feishu', 'lark'],
+      description: '飞书鸿蒙原生版，约 40%+ 界面控件带有显式 id 与大量 SymbolGlyph/Stack 复合布局。',
+      knownPages: pages,
+      uiQuirks: [
+        '【高密度 id 树】飞书大量图标使用 SymbolGlyph 且带有稳定 component id，优先通过 @ref 或 id 匹配；无文本的复合 Row/Stack 容器依赖语义聚合描述。'
+      ],
+      fastRecipes: {}
+    };
+  }
+
+  private static getAlipayProfile(): AppProfile {
+    return {
+      bundleName: 'com.alipay.mobile.client',
+      displayName: '支付宝 (HarmonyOS NEXT)',
+      mainAbility: 'EntryAbility',
+      pace: 'careful',
+      aliases: ['支付宝', 'alipay'],
+      description: '蚂蚁支付宝鸿蒙原生版（注意真机包名为 com.alipay.mobile.client）。',
+      knownPages: {},
+      uiQuirks: [
+        '【支付/隐私安全】涉及付款码、转账确认、余额密码页可能开启防截屏或安全键盘，遇到此类页面必须立即停下交由用户亲自操作。',
+        '【顶部功能区与搜索】顶部搜索框直达小程序/生活服务最快，尽量避免在首页金刚区盲目滑动。'
+      ],
+      fastRecipes: {}
     };
   }
 
@@ -72,12 +140,14 @@ export class AppKnowledgeBase {
     return {
       bundleName: 'com.huawei.hmos.notepad',
       displayName: '华为备忘录',
+      mainAbility: 'EntryAbility',
+      pace: 'normal',
       aliases: ['备忘录', '便签', 'notepad', 'notes'],
-      description: '华为系统备忘录应用。用于记录笔记、待办事项和速记。',
+      description: '华为系统备忘录应用，用于记录笔记与待办。',
+      knownPages: {},
       uiQuirks: [
-        '【新建笔记】主界面底部中心有新建笔记悬浮按钮（通常包含“+”或“新建笔记”图标）。',
-        '【标题与正文】进入编辑页后，顶部是标题输入框，下方大区域是正文输入框。',
-        '【完成保存】编辑完成后点击右上角勾选图标或发送 Back 键即可自动保存。'
+        '【新建笔记】主界面底部有新建笔记悬浮按钮；进入编辑页后顶部为标题栏，下方为正文输入框。',
+        '【保存退出】编辑完成后点击右上角确认勾选图标或发送 back 按键保存。'
       ],
       fastRecipes: recipes
     };
@@ -90,36 +160,60 @@ export class AppKnowledgeBase {
     return {
       bundleName: 'com.huawei.hmos.settings',
       displayName: '系统设置',
+      mainAbility: 'EntryAbility',
+      pace: 'normal',
       aliases: ['设置', '系统设置', 'settings'],
-      description: 'HarmonyOS NEXT 系统设置，控制网络、蓝牙、显示、权限等核心选项。',
+      description: 'HarmonyOS NEXT 系统设置。',
+      knownPages: {},
       uiQuirks: [
-        '【顶部搜索】设置首页顶部常驻全局搜索栏，查找具体配置项（如 Wi-Fi、蓝牙、应用管理）优先在搜索栏输入关键词直达，避免盲目长距离滚动。'
+        '【顶部搜索】查找 Wi-Fi、蓝牙、应用管理等设置项优先使用顶部搜索栏直达，减少盲目长滚动。'
       ],
       fastRecipes: recipes
     };
   }
 
-  private static getAlipayProfile(): AppProfile {
-    const recipes: Record<string, RecipeStep[]> = {};
+  private static getMeituanProfile(): AppProfile {
     return {
-      bundleName: 'com.eg.android.AlipayGphone',
-      displayName: '支付宝',
-      aliases: ['支付宝', 'alipay'],
-      description: '蚂蚁集团支付宝，包含扫一扫、付款码、搜索生活号与小程序。',
+      bundleName: 'com.sankuai.hmeituan',
+      displayName: '美团 (HarmonyOS NEXT)',
+      mainAbility: 'EntryAbility',
+      pace: 'careful',
+      aliases: ['美团', 'meituan'],
+      description: '美团鸿蒙原生版，覆盖外卖、团购与到店服务。',
+      knownPages: {},
       uiQuirks: [
-        '【顶部功能区】顶部横排包含扫一扫、收付款、出行等快捷图标。',
-        '【搜索框】顶部中心常驻搜索框，进入小程序或生活号最快捷路径是搜索。'
+        '【外卖区分与下单确认】注意首页频道入口与底部标签的跳转差异；进入结算/支付页前必须停下由用户确认金额与下单。'
       ],
-      fastRecipes: recipes
+      fastRecipes: {}
+    };
+  }
+
+  private static getTaobaoProfile(): AppProfile {
+    return {
+      bundleName: 'com.taobao.taobao4hmos',
+      displayName: '淘宝 (HarmonyOS NEXT)',
+      mainAbility: 'EntryAbility',
+      pace: 'careful',
+      aliases: ['淘宝', 'taobao'],
+      description: '淘宝鸿蒙原生版（注意真机包名为 com.taobao.taobao4hmos）。',
+      knownPages: {},
+      uiQuirks: [
+        '【下单止损边界】支持搜索、筛选与加购，禁止自动提交结算付款；高频翻页注意防风控。'
+      ],
+      fastRecipes: {}
     };
   }
 
   private static getAllProfiles(): AppProfile[] {
     return [
       AppKnowledgeBase.getWechatProfile(),
+      AppKnowledgeBase.getXhsProfile(),
+      AppKnowledgeBase.getFeishuProfile(),
+      AppKnowledgeBase.getAlipayProfile(),
       AppKnowledgeBase.getNotepadProfile(),
       AppKnowledgeBase.getSettingsProfile(),
-      AppKnowledgeBase.getAlipayProfile()
+      AppKnowledgeBase.getMeituanProfile(),
+      AppKnowledgeBase.getTaobaoProfile()
     ];
   }
 
@@ -148,6 +242,33 @@ export class AppKnowledgeBase {
     return null;
   }
 
+  static isCarefulApp(bundleName?: string): boolean {
+    if (!bundleName || bundleName.trim().length === 0) {
+      return false;
+    }
+    const profile = AppKnowledgeBase.findProfile(bundleName);
+    return profile !== null && profile.pace === 'careful';
+  }
+
+  static formatCompactHint(profile: AppProfile): string {
+    const lines: string[] = [
+      `[App Knowledge: ${profile.displayName} (${profile.bundleName}) | pace=${profile.pace}]`
+    ];
+    const pageKeys = Object.keys(profile.knownPages);
+    if (pageKeys.length > 0) {
+      const pageDesc = pageKeys.map(k => `${k}=${profile.knownPages[k]}`).join('; ');
+      lines.push(`- 已知页面: ${pageDesc}`);
+    }
+    for (let i = 0; i < profile.uiQuirks.length; i++) {
+      lines.push(`- ${profile.uiQuirks[i]}`);
+    }
+    const recipeNames = Object.keys(profile.fastRecipes);
+    if (recipeNames.length > 0) {
+      lines.push(`- 常用 fastRecipes: ${recipeNames.join(', ')}`);
+    }
+    return lines.join('\n');
+  }
+
   /**
    * Formats application knowledge guidance to be injected into agent / worker prompts.
    */
@@ -169,7 +290,7 @@ export class AppKnowledgeBase {
 
   private static formatProfile(profile: AppProfile): string {
     const lines: string[] = [
-      `#### 📦 应用: ${profile.displayName} (\`${profile.bundleName}\`)`,
+      `#### 📦 应用: ${profile.displayName} (\`${profile.bundleName}\`, ability=\`${profile.mainAbility}\`, pace=\`${profile.pace}\`)`,
       `- **说明**: ${profile.description}`,
       `- **界面特征与避坑要点**:`
     ];

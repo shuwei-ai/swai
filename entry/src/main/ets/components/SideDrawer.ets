@@ -1,16 +1,16 @@
 /*
- * SideDrawer: Clean & Minimalist Navigation Drawer (Mika Inspired).
- * Retains core navigation modules + Mika-style Footer (About on left, GitHub repo on right):
- * 1. App Header (Swai Logo with live status)
- * 2. Swai 智能体
- * 3. Shell 终端
- * 4. 浏览器
- * 5. Footer: 关于 (About Swai) on bottom left, GitHub repo on bottom right.
+ * SideDrawer: HarmonyOS NEXT Native Navigation Drawer (ClashBox Inspired).
+ * Uses grey-surface + white-card grouping, native SymbolGlyph icons,
+ * system semantic colors, and native bindMenu/Toggle controls.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 import hilog from '@ohos.hilog';
+import { LengthMetrics, SymbolGlyphModifier } from '@kit.ArkUI';
+import { deviceInfo } from '@kit.BasicServicesKit';
+import { BackgroundKeepAliveManager, KeepAliveMode } from '../service/BackgroundKeepAliveManager';
+import { ThinkingCapsuleManager } from '../window/ThinkingCapsuleManager';
 import {
   DebugPhaseUiCopy,
   getDebugPhaseSummary,
@@ -19,32 +19,32 @@ import {
 
 @Component
 struct SideDrawerNavRow {
-  @Prop icon: string = '';
+  @Prop symbolIcon: Resource = $r('sys.symbol.house_fill');
   @Prop label: string = '';
   @Prop isSelected: boolean = false;
   onClickItem?: () => void = undefined;
 
   build() {
     Row({ space: 12 }) {
-      Text(this.icon)
-        .fontSize(16)
+      SymbolGlyph(this.symbolIcon)
+        .fontSize(20)
+        .fontColor([this.isSelected ? $r('sys.color.icon_emphasize') : $r('sys.color.icon_secondary')])
+        .renderingStrategy(SymbolRenderingStrategy.MULTIPLE_OPACITY)
 
       Text(this.label)
         .fontSize(15)
-        .fontWeight(this.isSelected ? FontWeight.Bold : FontWeight.Normal)
-        .fontColor(this.isSelected ? '#0284c7' : '#1e293b')
+        .fontWeight(this.isSelected ? FontWeight.Medium : FontWeight.Normal)
+        .fontColor(this.isSelected ? $r('sys.color.icon_emphasize') : $r('sys.color.font_primary'))
         .layoutWeight(1)
-
-      if (this.isSelected) {
-        Circle({ width: 6, height: 6 })
-          .fill('#0284c7')
-      }
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
     }
     .width('100%')
     .height(48)
-    .padding({ left: 14, right: 14 })
-    .borderRadius(12)
-    .backgroundColor(this.isSelected ? '#f0f9ff' : 'transparent')
+    .padding({ left: 12, right: 12 })
+    .borderRadius(14)
+    .backgroundColor(this.isSelected ? 'rgba(10, 89, 247, 0.08)' : Color.Transparent)
+    .clickEffect({ level: ClickEffectLevel.LIGHT })
     .onClick(() => {
       if (this.onClickItem) {
         this.onClickItem();
@@ -63,6 +63,12 @@ export struct SideDrawer {
   @Prop @Watch('onCurrentActivePageChange') currentActivePage: string = 'dsh'; // 'console' | 'dsh' | 'browser'
   @State private activePage: string = 'dsh';
   @State private isAboutOpen: boolean = false;
+  @State private showKeepAliveMenu: boolean = false;
+  @StorageProp('bgKeepAliveMode') bgKeepAliveMode: KeepAliveMode = 'location';
+  @StorageProp('bgKeepAliveActive') bgKeepAliveActive: boolean = false;
+  @StorageProp('bgKeepAliveStatusText') bgKeepAliveStatusText: string = '准备启动';
+  @StorageProp('thinkingCapsuleEnabled') thinkingCapsuleEnabled: boolean = true;
+  @StorageProp('thinkingCapsuleSurface') thinkingCapsuleSurface: string = '待命就绪';
 
   onClose?: () => void = undefined;
   onSelectPage?: (page: 'console' | 'dsh' | 'browser') => void = undefined;
@@ -77,54 +83,50 @@ export struct SideDrawer {
     return getDebugPhaseSummary(this.getEffectivePhase(), this.debugPort);
   }
 
-  private getHeaderDotColor(): string {
+  private getStatusDotColor(): ResourceColor {
     const phase = this.getEffectivePhase();
     if (phase === 'connected') {
-      return '#22c55e';
+      return $r('sys.color.confirm');
     }
     if (phase === 'auth_rejected') {
-      return '#ef4444';
+      return $r('sys.color.warning');
     }
     if (phase === 'checking' || phase === 'awaiting_auth') {
-      return '#0284c7';
+      return $r('sys.color.icon_emphasize');
     }
-    return '#f59e0b';
+    return $r('sys.color.alert');
   }
 
-  private getHeaderTextColor(): string {
+  private getStatusTextColor(): ResourceColor {
     const phase = this.getEffectivePhase();
     if (phase === 'connected') {
-      return '#15803d';
+      return $r('sys.color.font_secondary');
     }
     if (phase === 'auth_rejected') {
-      return '#b91c1c';
+      return $r('sys.color.warning');
     }
     if (phase === 'checking' || phase === 'awaiting_auth') {
-      return '#0369a1';
+      return $r('sys.color.icon_emphasize');
     }
-    return '#b45309';
+    return $r('sys.color.alert');
   }
 
-  private getBadgeBgColor(): string {
-    const phase = this.getEffectivePhase();
-    if (phase === 'auth_rejected') {
-      return '#fee2e2';
+  private getKeepAliveModeLabel(mode: KeepAliveMode): string {
+    switch (mode) {
+      case 'location':
+        return '模拟定位';
+      case 'dataTransfer':
+        return '模拟下载';
+      case 'taskKeeping':
+        return '任务保持';
+      case 'off':
+      default:
+        return '关闭';
     }
-    if (phase === 'checking' || phase === 'awaiting_auth') {
-      return '#e0f2fe';
-    }
-    return '#fef3c7';
   }
 
-  private getBadgeTextColor(): string {
-    const phase = this.getEffectivePhase();
-    if (phase === 'auth_rejected') {
-      return '#b91c1c';
-    }
-    if (phase === 'checking' || phase === 'awaiting_auth') {
-      return '#0369a1';
-    }
-    return '#b45309';
+  private isTabletOr2in1(): boolean {
+    return deviceInfo.deviceType === 'tablet' || deviceInfo.deviceType === '2in1';
   }
 
   aboutToAppear() {
@@ -140,7 +142,88 @@ export struct SideDrawer {
     if (this.isOpen) {
       hilog.info(0x3F00, 'SideDrawer', 'drawer opened, syncing activePage=%{public}s from currentActivePage=%{public}s', this.activePage, this.currentActivePage);
       this.activePage = this.currentActivePage;
+    } else {
+      this.showKeepAliveMenu = false;
     }
+  }
+
+  @Builder
+  KeepAliveModeMenu() {
+    Menu() {
+      MenuItem({ content: '后台保活模式' })
+        .contentFont({ size: 13, weight: FontWeight.Medium })
+        .contentFontColor($r('sys.color.font_secondary'))
+        .enabled(false)
+
+      MenuItem({
+        content: '模拟定位',
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.compass_circle'))
+          .fontColor([$r('sys.color.icon_primary')]),
+        symbolEndIcon: this.bgKeepAliveMode === 'location'
+          ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([$r('sys.color.icon_emphasize')])
+          : undefined
+      })
+        .contentFont({ size: 15 })
+        .contentFontColor(this.bgKeepAliveMode === 'location' ? $r('sys.color.icon_emphasize') : $r('sys.color.font_primary'))
+        .onClick(() => {
+          BackgroundKeepAliveManager.getInstance().setMode('location');
+          this.showKeepAliveMenu = false;
+        })
+
+      MenuItem({
+        content: '模拟下载',
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.circle_and_arrow_down'))
+          .fontColor([$r('sys.color.icon_primary')]),
+        symbolEndIcon: this.bgKeepAliveMode === 'dataTransfer'
+          ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([$r('sys.color.icon_emphasize')])
+          : undefined
+      })
+        .contentFont({ size: 15 })
+        .contentFontColor(this.bgKeepAliveMode === 'dataTransfer' ? $r('sys.color.icon_emphasize') : $r('sys.color.font_primary'))
+        .onClick(() => {
+          BackgroundKeepAliveManager.getInstance().setMode('dataTransfer');
+          this.showKeepAliveMenu = false;
+        })
+
+      if (this.isTabletOr2in1()) {
+        MenuItem({
+          content: '任务保持',
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.lock_filled_arrow_counterclockwise'))
+            .fontColor([$r('sys.color.icon_primary')]),
+          symbolEndIcon: this.bgKeepAliveMode === 'taskKeeping'
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([$r('sys.color.icon_emphasize')])
+            : undefined
+        })
+          .contentFont({ size: 15 })
+          .contentFontColor(this.bgKeepAliveMode === 'taskKeeping' ? $r('sys.color.icon_emphasize') : $r('sys.color.font_primary'))
+          .onClick(() => {
+            BackgroundKeepAliveManager.getInstance().setMode('taskKeeping');
+            this.showKeepAliveMenu = false;
+          })
+      }
+
+      MenuItem({
+        content: '关闭',
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.nosign'))
+          .fontColor([$r('sys.color.icon_secondary')]),
+        symbolEndIcon: this.bgKeepAliveMode === 'off'
+          ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([$r('sys.color.icon_emphasize')])
+          : undefined
+      })
+        .contentFont({ size: 15 })
+        .contentFontColor(this.bgKeepAliveMode === 'off' ? $r('sys.color.icon_emphasize') : $r('sys.color.font_secondary'))
+        .onClick(() => {
+          BackgroundKeepAliveManager.getInstance().setMode('off');
+          this.showKeepAliveMenu = false;
+        })
+    }
+    .menuItemDivider({
+      color: $r('sys.color.comp_divider'),
+      strokeWidth: LengthMetrics.vp(0.5),
+      startMargin: LengthMetrics.vp(12),
+      endMargin: LengthMetrics.vp(12)
+    })
+    .borderRadius(20)
   }
 
   build() {
@@ -150,7 +233,7 @@ export struct SideDrawer {
         Column()
           .width('100%')
           .height('100%')
-          .backgroundColor('rgba(15, 23, 42, 0.45)')
+          .backgroundColor('rgba(0, 0, 0, 0.35)')
           .onClick(() => {
             if (this.isAboutOpen) {
               this.isAboutOpen = false;
@@ -160,222 +243,308 @@ export struct SideDrawer {
               this.onClose();
             }
           })
-          .animation({ duration: 250, curve: Curve.EaseInOut })
+          .animation({ duration: 240, curve: Curve.EaseInOut })
       }
 
-      // 2. Sliding Drawer Panel
+      // 2. Sliding Drawer Panel (HarmonyOS grey-surface + white-card architecture)
       Column() {
-        // App Header Section
-        Row() {
-          // App Logo
-          Image($r('app.media.startIcon'))
-            .width(38)
-            .height(38)
-            .borderRadius(10)
-            .shadow({ radius: 8, color: 'rgba(0,0,0,0.08)', offsetY: 2 })
-            .margin({ right: 10 })
+        // Header: App Identity + Native Circular Close Button
+        Row({ space: 12 }) {
+          Row({ space: 10 }) {
+            Image($r('app.media.startIcon'))
+              .width(38)
+              .height(38)
+              .borderRadius(10)
 
-          Column({ space: 3 }) {
-            Text('Swai')
-              .fontSize(16)
-              .fontWeight(FontWeight.Bold)
-              .fontColor('#0f172a')
+            Column({ space: 3 }) {
+              Text('Swai')
+                .fontSize(18)
+                .fontWeight(FontWeight.Bold)
+                .fontColor($r('sys.color.font_primary'))
 
-            Row({ space: 4 }) {
-              Circle({ width: 6, height: 6 })
-                .fill(this.getHeaderDotColor())
-              Text(this.getDebugSummary().headerText)
-                .fontSize(10)
-                .fontColor(this.getHeaderTextColor())
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Row({ space: 5 }) {
+                Circle({ width: 6, height: 6 })
+                  .fill(this.getStatusDotColor())
+                Text(this.getDebugSummary().headerText)
+                  .fontSize(11)
+                  .fontColor($r('sys.color.font_secondary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
             }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
           }
           .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start)
+          .alignItems(VerticalAlign.Center)
+          .onClick(() => {
+            if (this.onOpenDebugGuide) {
+              this.onOpenDebugGuide();
+            }
+          })
+
+          Button({ type: ButtonType.Circle, stateEffect: true }) {
+            SymbolGlyph($r('sys.symbol.xmark'))
+              .fontSize(17)
+              .fontColor([$r('sys.color.icon_primary')])
+          }
+          .width(34)
+          .height(34)
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .clickEffect({ level: ClickEffectLevel.LIGHT })
+          .onClick(() => {
+            if (this.onClose) {
+              this.onClose();
+            }
+          })
         }
         .width('100%')
-        .padding({ left: 16, right: 16, top: 48, bottom: 20 })
+        .padding({ left: 18, right: 16, top: 52, bottom: 16 })
         .alignItems(VerticalAlign.Center)
-        .onClick(() => {
-          if (this.onOpenDebugGuide) {
-            this.onOpenDebugGuide();
-          }
-        })
 
-        Divider()
-          .color('#f1f5f9')
-          .margin({ left: 16, right: 16, bottom: 12 })
+        // Scrollable Grouped Content (Spring edge effect, ClashBox List pattern)
+        List({ space: 12 }) {
+          // Group 1: Core Navigation Card
+          ListItem() {
+            Column({ space: 2 }) {
+              SideDrawerNavRow({
+                symbolIcon: $r('sys.symbol.message_on_message_fill'),
+                label: 'Swai 智能体',
+                isSelected: this.activePage === 'dsh',
+                onClickItem: () => {
+                  this.activePage = 'dsh';
+                  if (this.onSelectPage) {
+                    this.onSelectPage('dsh');
+                  }
+                }
+              })
 
-        // Core Real Navigation Items
-        Column({ space: 8 }) {
-          // Swai Agent
-          SideDrawerNavRow({
-            icon: '🤖',
-            label: 'Swai 智能体',
-            isSelected: this.activePage === 'dsh',
-            onClickItem: () => {
-              this.activePage = 'dsh';
-              if (this.onSelectPage) {
-                this.onSelectPage('dsh');
-              }
-            }
-          })
+              SideDrawerNavRow({
+                symbolIcon: $r('sys.symbol.doc_plaintext'),
+                label: 'Shell 终端',
+                isSelected: this.activePage === 'console',
+                onClickItem: () => {
+                  this.activePage = 'console';
+                  if (this.onSelectPage) {
+                    this.onSelectPage('console');
+                  }
+                }
+              })
 
-          // Shell Terminal
-          SideDrawerNavRow({
-            icon: '💻',
-            label: 'Shell 终端',
-            isSelected: this.activePage === 'console',
-            onClickItem: () => {
-              this.activePage = 'console';
-              if (this.onSelectPage) {
-                this.onSelectPage('console');
-              }
-            }
-          })
-
-          // Browser
-          SideDrawerNavRow({
-            icon: '🌐',
-            label: '浏览器',
-            isSelected: this.activePage === 'browser',
-            onClickItem: () => {
-              this.activePage = 'browser';
-              if (this.onSelectPage) {
-                this.onSelectPage('browser');
-              }
-            }
-          })
-        }
-        .width('100%')
-        .padding({ left: 12, right: 12 })
-
-        // Plan A: Developer Debugging Guide Card (amber guide when not ready, compact green row when ready)
-        Column() {
-          if (!this.getDebugSummary().isReady) {
-            Column({ space: 6 }) {
-              Row({ space: 6 }) {
-                Text('🛠️')
-                  .fontSize(14)
-                Text(this.getDebugSummary().title)
-                  .fontSize(13)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor('#92400e')
-                  .layoutWeight(1)
-                Text(this.getDebugSummary().badgeText)
-                  .fontSize(10)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor(this.getBadgeTextColor())
-                  .backgroundColor(this.getBadgeBgColor())
-                  .padding({ left: 7, right: 7, top: 2, bottom: 2 })
-                  .borderRadius(10)
-              }
-              .width('100%')
-              .alignItems(VerticalAlign.Center)
-
-              Row({ space: 6 }) {
-                Text(this.getDebugSummary().subtitle)
-                  .fontSize(11)
-                  .fontColor('#78350f')
-                  .lineHeight(15)
-                  .layoutWeight(1)
-                Text(this.getDebugSummary().actionText)
-                  .fontSize(11)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor('#b45309')
-              }
-              .width('100%')
-              .alignItems(VerticalAlign.Bottom)
+              SideDrawerNavRow({
+                symbolIcon: $r('sys.symbol.compass_circle'),
+                label: '浏览器',
+                isSelected: this.activePage === 'browser',
+                onClickItem: () => {
+                  this.activePage = 'browser';
+                  if (this.onSelectPage) {
+                    this.onSelectPage('browser');
+                  }
+                }
+              })
             }
             .width('100%')
-            .padding(12)
-            .backgroundColor('#fffbeb')
-            .borderRadius(12)
-            .border({ width: 1, color: '#fde68a' })
-            .onClick(() => {
-              if (this.onOpenDebugGuide) {
-                this.onOpenDebugGuide();
-              }
-            })
-          } else {
-            Row({ space: 8 }) {
-              Circle({ width: 7, height: 7 })
-                .fill('#22c55e')
-              Text('开发者调试')
-                .fontSize(13)
-                .fontWeight(FontWeight.Medium)
-                .fontColor('#166534')
+            .padding(6)
+            .backgroundColor($r('sys.color.comp_background_list_card'))
+            .borderRadius(20)
+          }
+
+          // Section Title: System & Runtime
+          ListItem() {
+            Text('运行与调试')
+              .fontSize(12)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('sys.color.font_secondary'))
+              .padding({ left: 12, top: 4 })
+          }
+
+          // Group 2: Unified System Settings Card (Debug + Keep-Alive + Thinking Capsule)
+          ListItem() {
+            Column() {
+              // Row 1: Developer Debugging
+              Row({ space: 12 }) {
+                SymbolGlyph($r('sys.symbol.wrench_and_screwdriver'))
+                  .fontSize(20)
+                  .fontColor([$r('sys.color.icon_emphasize')])
+                  .renderingStrategy(SymbolRenderingStrategy.MULTIPLE_OPACITY)
+
+                Column({ space: 2 }) {
+                  Text('开发者调试')
+                    .fontSize(15)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('sys.color.font_primary'))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+                  Text(this.getDebugSummary().subtitle)
+                    .fontSize(12)
+                    .fontColor($r('sys.color.font_secondary'))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
                 .layoutWeight(1)
-              Text(this.getDebugSummary().badgeText)
-                .fontSize(10)
-                .fontWeight(FontWeight.Medium)
-                .fontColor('#15803d')
-                .backgroundColor('#dcfce7')
-                .padding({ left: 7, right: 7, top: 2, bottom: 2 })
-                .borderRadius(10)
-              Text('›')
-                .fontSize(14)
-                .fontColor('#16a34a')
+                .alignItems(HorizontalAlign.Start)
+
+                Row({ space: 5 }) {
+                  Circle({ width: 6, height: 6 })
+                    .fill(this.getStatusDotColor())
+                  Text(this.getDebugSummary().badgeText)
+                    .fontSize(12)
+                    .fontColor(this.getStatusTextColor())
+                  SymbolGlyph($r('sys.symbol.chevron_right'))
+                    .fontSize(18)
+                    .fontColor([$r('sys.color.icon_tertiary')])
+                }
+                .alignItems(VerticalAlign.Center)
+              }
+              .width('100%')
+              .constraintSize({ minHeight: 56 })
+              .padding({ left: 14, right: 12, top: 10, bottom: 10 })
+              .alignItems(VerticalAlign.Center)
+              .clickEffect({ level: ClickEffectLevel.LIGHT })
+              .onClick(() => {
+                if (this.onOpenDebugGuide) {
+                  this.onOpenDebugGuide();
+                }
+              })
+
+              Divider()
+                .color($r('sys.color.comp_divider'))
+                .strokeWidth(0.5)
+                .margin({ left: 46, right: 14 })
+
+              // Row 2: Background Keep-Alive (ClashBox MENU pattern)
+              Row({ space: 12 }) {
+                SymbolGlyph($r('sys.symbol.bolt_filled_on_circle'))
+                  .fontSize(20)
+                  .fontColor([$r('sys.color.icon_emphasize')])
+                  .renderingStrategy(SymbolRenderingStrategy.MULTIPLE_OPACITY)
+
+                Column({ space: 2 }) {
+                  Text('后台保活')
+                    .fontSize(15)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('sys.color.font_primary'))
+                    .maxLines(1)
+
+                  Text(this.bgKeepAliveStatusText)
+                    .fontSize(12)
+                    .fontColor($r('sys.color.font_secondary'))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
+
+                Row({ space: 5 }) {
+                  Text(this.getKeepAliveModeLabel(this.bgKeepAliveMode))
+                    .fontSize(13)
+                    .fontColor($r('sys.color.font_secondary'))
+                  SymbolGlyph($r('sys.symbol.arrowtriangle_down_fill'))
+                    .fontSize(11)
+                    .fontColor([$r('sys.color.icon_tertiary')])
+                }
+                .alignItems(VerticalAlign.Center)
+              }
+              .width('100%')
+              .constraintSize({ minHeight: 56 })
+              .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+              .alignItems(VerticalAlign.Center)
+              .clickEffect({ level: ClickEffectLevel.LIGHT })
+              .bindMenu(this.showKeepAliveMenu, this.KeepAliveModeMenu(), {
+                placement: Placement.BottomRight,
+                onDisappear: () => {
+                  this.showKeepAliveMenu = false;
+                }
+              })
+              .onClick(() => {
+                this.showKeepAliveMenu = true;
+              })
+
+              Divider()
+                .color($r('sys.color.comp_divider'))
+                .strokeWidth(0.5)
+                .margin({ left: 46, right: 14 })
+
+              // Row 3: Thinking Capsule (ClashBox toggleRowList pattern)
+              Row({ space: 12 }) {
+                SymbolGlyph($r('sys.symbol.circle_filled_and_circle'))
+                  .fontSize(20)
+                  .fontColor([$r('sys.color.icon_emphasize')])
+                  .renderingStrategy(SymbolRenderingStrategy.MULTIPLE_OPACITY)
+
+                Column({ space: 2 }) {
+                  Text('思考胶囊')
+                    .fontSize(15)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('sys.color.font_primary'))
+                    .maxLines(1)
+
+                  Text(this.thinkingCapsuleSurface)
+                    .fontSize(12)
+                    .fontColor($r('sys.color.font_secondary'))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
+
+                Toggle({ type: ToggleType.Switch, isOn: this.thinkingCapsuleEnabled })
+                  .selectedColor($r('sys.color.icon_emphasize'))
+                  .hitTestBehavior(HitTestMode.None)
+              }
+              .width('100%')
+              .constraintSize({ minHeight: 56 })
+              .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+              .alignItems(VerticalAlign.Center)
+              .clickEffect({ level: ClickEffectLevel.LIGHT })
+              .onClick(() => {
+                ThinkingCapsuleManager.getInstance().setEnabled(!this.thinkingCapsuleEnabled);
+              })
             }
             .width('100%')
-            .height(42)
-            .padding({ left: 12, right: 12 })
-            .backgroundColor('#f0fdf4')
-            .borderRadius(12)
-            .border({ width: 1, color: '#dcfce7' })
-            .alignItems(VerticalAlign.Center)
-            .onClick(() => {
-              if (this.onOpenDebugGuide) {
-                this.onOpenDebugGuide();
-              }
-            })
+            .backgroundColor($r('sys.color.comp_background_list_card'))
+            .borderRadius(20)
           }
         }
+        .layoutWeight(1)
         .width('100%')
-        .padding({ left: 12, right: 12, top: 14 })
+        .padding({ left: 14, right: 14 })
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
 
-        Blank()
-
-        Divider()
-          .color('#f1f5f9')
-          .margin({ left: 16, right: 16, bottom: 12 })
-
-        // 5. Mika-Style Footer: About on left, GitHub Repo on right
+        // Lightweight Native Footer (No heavy borders or Tailwind pills)
         Row() {
-          // Left: 关于 (About)
           Row({ space: 6 }) {
-            Text('ⓘ')
-              .fontSize(14)
-              .fontColor('#64748b')
+            SymbolGlyph($r('sys.symbol.info_circle'))
+              .fontSize(16)
+              .fontColor([$r('sys.color.icon_secondary')])
             Text('关于')
               .fontSize(13)
               .fontWeight(FontWeight.Medium)
-              .fontColor('#475569')
+              .fontColor($r('sys.color.font_secondary'))
           }
-          .padding({ left: 10, right: 12, top: 8, bottom: 8 })
-          .borderRadius(8)
-          .backgroundColor('#f8fafc')
+          .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+          .borderRadius(12)
+          .clickEffect({ level: ClickEffectLevel.LIGHT })
           .onClick(() => {
             this.isAboutOpen = true;
           })
 
           Blank()
 
-          // Right: GitHub 开源仓库地址
-          Row({ space: 5 }) {
-            Text('⌥')
+          Row({ space: 6 }) {
+            SymbolGlyph($r('sys.symbol.paperplane'))
+              .fontSize(15)
+              .fontColor([$r('sys.color.icon_secondary')])
+            Text('GitHub')
               .fontSize(13)
-              .fontColor('#0284c7')
-            Text('GitHub ↗')
-              .fontSize(12)
-              .fontWeight(FontWeight.Bold)
-              .fontColor('#0284c7')
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('sys.color.font_secondary'))
           }
-          .padding({ left: 10, right: 12, top: 8, bottom: 8 })
-          .borderRadius(8)
-          .backgroundColor('#f0f9ff')
-          .border({ width: 1, color: '#e0f2fe' })
+          .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+          .borderRadius(12)
+          .clickEffect({ level: ClickEffectLevel.LIGHT })
           .onClick(() => {
             this.activePage = 'browser';
             if (this.onOpenUrl) {
@@ -384,83 +553,75 @@ export struct SideDrawer {
           })
         }
         .width('100%')
-        .padding({ left: 14, right: 14, bottom: 28 })
+        .padding({ left: 14, right: 14, top: 8, bottom: 28 })
         .alignItems(VerticalAlign.Center)
       }
-      .width('72%')
+      .width('78%')
+      .constraintSize({ maxWidth: 320 })
       .height('100%')
-      .backgroundColor('#ffffff')
-      .borderRadius({ topRight: 20, bottomRight: 20 })
-      .shadow({ radius: 24, color: 'rgba(0, 0, 0, 0.25)', offsetX: 4, offsetY: 0 })
-      .offset({ x: this.isOpen ? 0 : -350 })
-      .animation({ duration: 280, curve: Curve.FastOutSlowIn })
+      .backgroundColor($r('sys.color.background_secondary'))
+      .borderRadius({ topRight: 24, bottomRight: 24 })
+      .shadow({ radius: 28, color: 'rgba(0, 0, 0, 0.14)', offsetX: 4, offsetY: 0 })
+      .offset({ x: this.isOpen ? 0 : -360 })
+      .animation({ duration: 260, curve: Curve.FastOutSlowIn })
 
-      // 3. About Modal Overlay
+      // 3. About Modal Overlay (Clean HarmonyOS Native Dialog)
       if (this.isAboutOpen) {
         Stack({ alignContent: Alignment.Center }) {
           Column()
             .width('100%')
             .height('100%')
-            .backgroundColor('rgba(15, 23, 42, 0.65)')
+            .backgroundColor('rgba(0, 0, 0, 0.45)')
             .onClick(() => {
               this.isAboutOpen = false;
             })
 
-          Column({ space: 14 }) {
-            // Icon + Title + Version
+          Column({ space: 16 }) {
             Column({ space: 6 }) {
               Image($r('app.media.startIcon'))
-                .width(64)
-                .height(64)
+                .width(58)
+                .height(58)
                 .borderRadius(14)
-                .shadow({ radius: 12, color: 'rgba(0,0,0,0.08)', offsetY: 4 })
 
               Text('Swai')
-                .fontSize(22)
+                .fontSize(20)
                 .fontWeight(FontWeight.Bold)
-                .fontColor('#0f172a')
+                .fontColor($r('sys.color.font_primary'))
                 .margin({ top: 4 })
 
-              Text('枢维智能 · 个人智能体 (v1.0.0)')
+              Text('v1.0.0 · 枢维智能')
                 .fontSize(12)
-                .fontColor('#64748b')
+                .fontColor($r('sys.color.font_secondary'))
             }
             .alignItems(HorizontalAlign.Center)
             .width('100%')
 
-            Divider()
-              .color('#f1f5f9')
+            Text('面向 HarmonyOS NEXT 的端侧个人智能体与系统自动化平台，端侧数据不离机，全流程开源。')
+              .fontSize(13)
+              .fontColor($r('sys.color.font_secondary'))
+              .lineHeight(20)
+              .textAlign(TextAlign.Center)
 
-            // Details
-            Column({ space: 10 }) {
-              Text('Swai 是面向 HarmonyOS NEXT 的端侧个人专属智能体助手与端侧自动化平台，由枢维智能科技团队研发并全面开源。')
-                .fontSize(13)
-                .fontColor('#334155')
-                .lineHeight(20)
-
-              Column({ space: 6 }) {
-                this.buildAboutFeatureItem('🤖', '内置 DeepSeek Harness 原生引擎与长思维链')
-                this.buildAboutFeatureItem('🌐', '灵动画中画悬浮窗，跨应用多任务并行')
-                this.buildAboutFeatureItem('💻', '系统级特权通道 (uid 2000) 与 UI 自动化')
-                this.buildAboutFeatureItem('🔒', '端侧数据不离机，全流程隐私安全')
+            // Native inset info group
+            Column() {
+              Row() {
+                Text('开源仓库')
+                  .fontSize(14)
+                  .fontColor($r('sys.color.font_primary'))
+                Blank()
+                Text('shuwei-ai/swai')
+                  .fontSize(13)
+                  .fontColor($r('sys.color.icon_emphasize'))
+                  .margin({ right: 4 })
+                SymbolGlyph($r('sys.symbol.chevron_right'))
+                  .fontSize(16)
+                  .fontColor([$r('sys.color.icon_tertiary')])
               }
               .width('100%')
-              .padding(10)
-              .backgroundColor('#f8fafc')
-              .borderRadius(10)
-
-              Row({ space: 6 }) {
-                Text('开源仓库:')
-                  .fontSize(12)
-                  .fontColor('#64748b')
-                Text('https://github.com/shuwei-ai/swai')
-                  .fontSize(12)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor('#0284c7')
-                  .layoutWeight(1)
-              }
-              .width('100%')
-              .padding({ top: 4 })
+              .height(44)
+              .padding({ left: 14, right: 12 })
+              .alignItems(VerticalAlign.Center)
+              .clickEffect({ level: ClickEffectLevel.LIGHT })
               .onClick(() => {
                 this.isAboutOpen = false;
                 this.activePage = 'browser';
@@ -469,25 +630,38 @@ export struct SideDrawer {
                 }
               })
 
-              Text('开源协议: Apache-2.0 License')
-                .fontSize(11)
-                .fontColor('#94a3b8')
+              Divider()
+                .color($r('sys.color.comp_divider'))
+                .strokeWidth(0.5)
+                .margin({ left: 14, right: 14 })
+
+              Row() {
+                Text('开源协议')
+                  .fontSize(14)
+                  .fontColor($r('sys.color.font_primary'))
+                Blank()
+                Text('Apache-2.0')
+                  .fontSize(13)
+                  .fontColor($r('sys.color.font_secondary'))
+              }
+              .width('100%')
+              .height(44)
+              .padding({ left: 14, right: 14 })
+              .alignItems(VerticalAlign.Center)
             }
             .width('100%')
+            .backgroundColor($r('sys.color.background_secondary'))
+            .borderRadius(16)
 
-            Divider()
-              .color('#f1f5f9')
-
-            // Action Buttons
             Row({ space: 10 }) {
-              Button('访问 GitHub 仓库', { type: ButtonType.Normal })
-                .fontSize(13)
-                .height(38)
+              Button('访问仓库')
+                .fontSize(14)
+                .fontWeight(FontWeight.Medium)
+                .height(40)
                 .layoutWeight(1)
-                .borderRadius(8)
-                .backgroundColor('#f0f9ff')
-                .fontColor('#0284c7')
-                .border({ width: 1, color: '#bae6fd' })
+                .borderRadius(20)
+                .backgroundColor($r('sys.color.comp_background_tertiary'))
+                .fontColor($r('sys.color.font_primary'))
                 .onClick(() => {
                   this.isAboutOpen = false;
                   this.activePage = 'browser';
@@ -496,24 +670,26 @@ export struct SideDrawer {
                   }
                 })
 
-              Button('关闭', { type: ButtonType.Normal })
-                .fontSize(13)
-                .height(38)
+              Button('知道了')
+                .fontSize(14)
+                .fontWeight(FontWeight.Medium)
+                .height(40)
                 .layoutWeight(1)
-                .borderRadius(8)
-                .backgroundColor('#0284c7')
-                .fontColor('#ffffff')
+                .borderRadius(20)
+                .backgroundColor($r('sys.color.icon_emphasize'))
+                .fontColor($r('sys.color.font_on_primary'))
                 .onClick(() => {
                   this.isAboutOpen = false;
                 })
             }
             .width('100%')
           }
-          .width('86%')
-          .padding(20)
-          .backgroundColor('#ffffff')
-          .borderRadius(20)
-          .shadow({ radius: 32, color: 'rgba(0,0,0,0.25)', offsetY: 8 })
+          .width('84%')
+          .constraintSize({ maxWidth: 340 })
+          .padding(22)
+          .backgroundColor($r('sys.color.comp_background_list_card'))
+          .borderRadius(24)
+          .shadow({ radius: 28, color: 'rgba(0, 0, 0, 0.18)', offsetY: 8 })
         }
         .width('100%')
         .height('100%')
@@ -523,19 +699,5 @@ export struct SideDrawer {
     .width('100%')
     .height('100%')
     .hitTestBehavior(this.isOpen ? HitTestMode.Default : HitTestMode.None)
-  }
-
-  @Builder
-  buildAboutFeatureItem(icon: string, text: string) {
-    Row({ space: 8 }) {
-      Text(icon)
-        .fontSize(13)
-      Text(text)
-        .fontSize(12)
-        .fontColor('#475569')
-        .layoutWeight(1)
-    }
-    .width('100%')
-    .alignItems(VerticalAlign.Center)
   }
 }

@@ -143,6 +143,27 @@ int main() {
     assert(swshell::ComputePollTimeoutMs(1500000, 1000000) == 310000);
     assert(swshell::ComputePollTimeoutMs(999000, 1000000) == 1000);
 
+    // 13. Test ParseHostReadyBodyJson valid & invalid inputs
+    {
+        int port = 0;
+        std::string base_url;
+        std::string token;
+        bool ok = swshell::ParseHostReadyBodyJson(
+            R"({"phase":"running","port":38927,"baseUrl":"http://127.0.0.1:38927","token":"abc_123-XYZ"})",
+            port, base_url, token);
+        assert(ok);
+        assert(port == 38927);
+        assert(base_url == "http://127.0.0.1:38927");
+        assert(token == "abc_123-XYZ");
+    }
+    {
+        int port = 0;
+        std::string base_url;
+        std::string token;
+        assert(!swshell::ParseHostReadyBodyJson(R"({"port":0,"baseUrl":"http://127.0.0.1:0","token":"t"})", port, base_url, token));
+        assert(!swshell::ParseHostReadyBodyJson(R"({"port":38927,"baseUrl":"http://127.0.0.1:38927"})", port, base_url, token));
+    }
+
     std::cout << "All DshBridge and C ABI tests PASSED successfully!" << std::endl;
     return 0;
 }

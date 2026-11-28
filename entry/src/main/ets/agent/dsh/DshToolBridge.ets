@@ -10,6 +10,7 @@
 import { dshHostClaimNative, dshHostFinishNative, DshToolClaimResult, DshToolFinishInput } from '../../common/NativeBridge';
 import { ToolRegistry } from '../tools/ToolRegistry';
 import { DshImageProcessor } from './DshImageProcessor';
+import { ThinkingCapsuleManager } from '../../window/ThinkingCapsuleManager';
 import { ToolCall, ToolResult } from '../types';
 import hilog from '@ohos.hilog';
 
@@ -88,6 +89,19 @@ export class DshToolBridge {
       return;
     }
 
+    // Internal silent lifecycle telemetry from DSH agent loop -> ThinkingCapsuleManager
+    if (toolName === 'swai_capsule_event') {
+      ThinkingCapsuleManager.getInstance().onCapsuleEvent(claim.argsJson || '{}');
+      dshHostFinishNative({
+        requestId: reqId,
+        success: true,
+        output: 'ok',
+        error: '',
+        exitCode: 0
+      });
+      return;
+    }
+
     let actionDesc = '';
 
     try {
@@ -96,6 +110,7 @@ export class DshToolBridge {
     } catch (_) {}
 
     this.notify(toolName, actionDesc, 'started');
+    ThinkingCapsuleManager.getInstance().onToolStart(toolName, claim.argsJson || '{}');
 
     const toolCall: ToolCall = {
       id: reqId,
@@ -105,6 +120,13 @@ export class DshToolBridge {
         arguments: claim.argsJson || '{}'
       }
     };
+
+    const isScreenCaptureCmd = toolName === 'bash' &&
+      (actionDesc.includes('snapshot_display') || actionDesc.includes('uitest screenCap'));
+    let hidCapsuleForCapture = false;
+    if (isScreenCaptureCmd) {
+      hidCapsuleForCapture = await ThinkingCapsuleManager.getInstance().temporaryHideForAction('capture_screen');
+    }
 
     let result: ToolResult;
     try {
@@ -117,6 +139,10 @@ export class DshToolBridge {
         error: `Exception executing tool ${toolName}: ${err}`,
         isError: true
       };
+    } finally {
+      if (hidCapsuleForCapture) {
+        ThinkingCapsuleManager.getInstance().restoreAfterTemporaryHide();
+      }
     }
 
     const finishInput: DshToolFinishInput = {
@@ -128,6 +154,7 @@ export class DshToolBridge {
     };
 
     dshHostFinishNative(finishInput);
+    ThinkingCapsuleManager.getInstance().onToolFinish(toolName, claim.argsJson || '{}', result.isError);
     this.notify(toolName, actionDesc, result.isError ? 'failed' : 'completed');
   }
 }

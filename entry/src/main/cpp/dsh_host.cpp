@@ -221,14 +221,20 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
     runner_thread_ = std::thread([this, options]() {
         OH_LOG_Print(LOG_APP, LOG_INFO, 0xD051, "DSHHost", "DSH host runner thread starting...");
 
-        // 1. Locate and dlopen libnode.so
-        void* node_handle = dlopen("libnode.so", RTLD_NOW | RTLD_GLOBAL);
+        // 1. Locate and dlopen libnode.so (RTLD_LAZY avoids upfront binding of unused symbols in 126MB libnode.so)
+        auto dlopen_start = std::chrono::steady_clock::now();
+        void* node_handle = dlopen("libnode.so", RTLD_LAZY | RTLD_GLOBAL);
         if (!node_handle && !options.custom_node_path.empty()) {
-            node_handle = dlopen(options.custom_node_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+            node_handle = dlopen(options.custom_node_path.c_str(), RTLD_LAZY | RTLD_GLOBAL);
         }
         if (!node_handle) {
-            node_handle = dlopen("/data/storage/el1/bundle/libs/arm64/libnode.so", RTLD_NOW | RTLD_GLOBAL);
+            node_handle = dlopen("/data/storage/el1/bundle/libs/arm64/libnode.so", RTLD_LAZY | RTLD_GLOBAL);
         }
+        auto dlopen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - dlopen_start).count();
+        (void)dlopen_ms;
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xD051, "DSHHost", "dlopen libnode.so took %{public}lld ms",
+                     static_cast<long long>(dlopen_ms));
         if (!node_handle) {
             const char* dl_err = dlerror();
             std::string msg = dl_err ? dl_err : "Failed to load libnode.so";
@@ -337,6 +343,48 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                     "- id: message-feedback\n"
                     "  disabled: true\n"
                     "- id: ui-message-feedback\n"
+                    "  disabled: true\n"
+                    "- id: directory-picker\n"
+                    "  disabled: true\n"
+                    "- id: ui-shortcuts\n"
+                    "  disabled: true\n"
+                    "- id: ui-sidebar-terminal\n"
+                    "  disabled: true\n"
+                    "- id: terminal-controller\n"
+                    "  disabled: true\n"
+                    "- id: ui-plugin-manager\n"
+                    "  disabled: true\n"
+                    "- id: harness-dev-context\n"
+                    "  disabled: true\n"
+                    "- id: ui-cordis\n"
+                    "  disabled: true\n"
+                    "- id: session-log-download\n"
+                    "  disabled: true\n"
+                    "- id: ui-trajectory\n"
+                    "  disabled: true\n"
+                    "- id: cli-account\n"
+                    "  disabled: true\n"
+                    "- id: remote-connection\n"
+                    "  disabled: true\n"
+                    "- id: ui-settings-shell\n"
+                    "  disabled: true\n"
+                    "- id: ui-settings-session-log\n"
+                    "  disabled: true\n"
+                    "- id: entry-customization\n"
+                    "  disabled: true\n"
+                    "- id: ui-workflow-run\n"
+                    "  disabled: true\n"
+                    "- id: agent-team\n"
+                    "  disabled: true\n"
+                    "- id: tool-agent-team\n"
+                    "  disabled: true\n"
+                    "- id: ui-agent-team\n"
+                    "  disabled: true\n"
+                    "- id: ui-account-notifications\n"
+                    "  disabled: true\n"
+                    "- id: session-turn-outline\n"
+                    "  disabled: true\n"
+                    "- id: ui-session-panel\n"
                     "  disabled: true\n",
                     tools_mjs.c_str());
                 fclose(hpf);
@@ -351,7 +399,7 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
         std::string node_modules = options.runtime_root + "/node_modules";
         setenv("NODE_PATH", node_modules.c_str(), 1);
 
-        // 3. Create preload.js to prevent process.exit from killing host app, intercept signals, and capture unhandled errors
+        // 3. Create preload.js to prevent process.exit from killing host app, cache startup fs lookups, and push ready event
         std::string preload_js = options.workspace_root + "/preload.js";
         FILE* pfp = fopen(preload_js.c_str(), "w");
         if (pfp) {
@@ -360,15 +408,148 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "const path = require('path');\n"
                 "const { Readable } = require('stream');\n"
                 "const { EventEmitter } = require('events');\n"
+                "const Module = require('module');\n"
+                "const http = require('http');\n"
                 "const home = process.env.HOME || '.';\n"
                 "const logFile = path.join(home, 'stderr.log');\n"
                 "const outLogFile = path.join(home, 'stdout.log');\n"
                 "const readyFile = path.join(home, 'ready.json');\n"
                 "try { fs.chmodSync(home, 0o777); } catch(e){}\n"
+                "let errLogStream = null;\n"
+                "let outLogStream = null;\n"
+                "function getErrLogStream() {\n"
+                "  if (!errLogStream) {\n"
+                "    try { errLogStream = fs.createWriteStream(logFile, { flags: 'a' }); errLogStream.on('error', () => {}); } catch(_e) {}\n"
+                "  }\n"
+                "  return errLogStream;\n"
+                "}\n"
+                "function getOutLogStream() {\n"
+                "  if (!outLogStream) {\n"
+                "    try { outLogStream = fs.createWriteStream(outLogFile, { flags: 'a' }); outLogStream.on('error', () => {}); } catch(_e) {}\n"
+                "  }\n"
+                "  return outLogStream;\n"
+                "}\n"
                 "function writeLog(prefix, msg) {\n"
-                "  try { fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${prefix}: ${msg}\\n`); } catch(e){}\n"
+                "  try {\n"
+                "    const s = getErrLogStream();\n"
+                "    if (s) s.write(`[${new Date().toISOString()}] ${prefix}: ${msg}\\n`);\n"
+                "  } catch(e){}\n"
                 "}\n"
                 "writeLog('PRELOAD', 'Node preload script executing...');\n"
+                "// Startup boot-cache: caches read-only node_modules stat/realpath/package.json lookups until server ready\n"
+                "let disableBootCache = () => {};\n"
+                "try {\n"
+                "  const nodeModulesRoot = process.env.NODE_PATH ? (path.resolve(process.env.NODE_PATH) + '/') : '';\n"
+                "  if (nodeModulesRoot.length > 1) {\n"
+                "    const origStatSync = fs.statSync;\n"
+                "    const origLstatSync = fs.lstatSync;\n"
+                "    const origExistsSync = fs.existsSync;\n"
+                "    const origRealpathSync = fs.realpathSync;\n"
+                "    const origRealpathNative = fs.realpathSync.native;\n"
+                "    const origReadFileSync = fs.readFileSync;\n"
+                "    const statCache = new Map();\n"
+                "    const lstatCache = new Map();\n"
+                "    const realCache = new Map();\n"
+                "    const realNativeCache = new Map();\n"
+                "    const pkgCache = new Map();\n"
+                "    let bootCacheActive = true;\n"
+                "    const isEligible = (p) => bootCacheActive && typeof p === 'string' && p.startsWith(nodeModulesRoot) && !p.includes('..') && !p.endsWith('/');\n"
+                "    const makeNoEntryErr = (syscall, p) => Object.assign(new Error(`ENOENT: no such file or directory, ${syscall} '${p}'`), { errno: -2, code: 'ENOENT', syscall, path: p });\n"
+                "    const syncEsm = () => { try { if (typeof Module.syncBuiltinESMExports === 'function') Module.syncBuiltinESMExports(); } catch(_e) {} };\n"
+                "    const cachedStat = (cache, origFn, syscall, p, opts) => {\n"
+                "      if (!isEligible(p) || (opts && opts.bigint)) return origFn.call(fs, p, opts);\n"
+                "      let entry = cache.get(p);\n"
+                "      if (entry === undefined) {\n"
+                "        try {\n"
+                "          entry = { st: origFn.call(fs, p) };\n"
+                "          cache.set(p, entry);\n"
+                "        } catch (err) {\n"
+                "          if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {\n"
+                "            entry = { missing: err.code };\n"
+                "            cache.set(p, entry);\n"
+                "          } else {\n"
+                "            throw err;\n"
+                "          }\n"
+                "        }\n"
+                "      }\n"
+                "      if (entry.missing) {\n"
+                "        if (opts && opts.throwIfNoEntry === false) return undefined;\n"
+                "        throw makeNoEntryErr(syscall, p);\n"
+                "      }\n"
+                "      return entry.st;\n"
+                "    };\n"
+                "    fs.statSync = function(p, opts) { return cachedStat(statCache, origStatSync, 'stat', p, opts); };\n"
+                "    fs.lstatSync = function(p, opts) { return cachedStat(lstatCache, origLstatSync, 'lstat', p, opts); };\n"
+                "    fs.existsSync = function(p) {\n"
+                "      if (!isEligible(p)) return origExistsSync.call(fs, p);\n"
+                "      let entry = statCache.get(p);\n"
+                "      if (entry === undefined) {\n"
+                "        try {\n"
+                "          entry = { st: origStatSync.call(fs, p) };\n"
+                "          statCache.set(p, entry);\n"
+                "        } catch (err) {\n"
+                "          if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {\n"
+                "            entry = { missing: err.code };\n"
+                "            statCache.set(p, entry);\n"
+                "          } else {\n"
+                "            return false;\n"
+                "          }\n"
+                "        }\n"
+                "      }\n"
+                "      return !entry.missing;\n"
+                "    };\n"
+                "    const isUtf8RealpathOpts = (opts) => !opts || opts === 'utf8' || opts === 'utf-8' || (typeof opts === 'object' && (!opts.encoding || opts.encoding === 'utf8' || opts.encoding === 'utf-8'));\n"
+                "    const cachedRealpath = (cache, origFn, p, opts) => {\n"
+                "      if (!isEligible(p) || !isUtf8RealpathOpts(opts)) return origFn.call(fs, p, opts);\n"
+                "      let entry = cache.get(p);\n"
+                "      if (entry === undefined) {\n"
+                "        try {\n"
+                "          entry = { val: origFn.call(fs, p, opts) };\n"
+                "          cache.set(p, entry);\n"
+                "        } catch (err) {\n"
+                "          if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {\n"
+                "            entry = { err };\n"
+                "            cache.set(p, entry);\n"
+                "          } else {\n"
+                "            throw err;\n"
+                "          }\n"
+                "        }\n"
+                "      }\n"
+                "      if (entry.err) throw entry.err;\n"
+                "      return entry.val;\n"
+                "    };\n"
+                "    const wrappedRealpath = function(p, opts) { return cachedRealpath(realCache, origRealpathSync, p, opts); };\n"
+                "    wrappedRealpath.native = function(p, opts) { return cachedRealpath(realNativeCache, origRealpathNative, p, opts); };\n"
+                "    fs.realpathSync = wrappedRealpath;\n"
+                "    const isUtf8ReadOpts = (opts) => opts === 'utf8' || opts === 'utf-8' || (opts !== null && typeof opts === 'object' && /^utf-?8$/i.test(opts.encoding || '') && opts.flag === undefined);\n"
+                "    fs.readFileSync = function(p, opts) {\n"
+                "      if (isEligible(p) && p.endsWith('/package.json') && isUtf8ReadOpts(opts)) {\n"
+                "        let text = pkgCache.get(p);\n"
+                "        if (text === undefined) {\n"
+                "          text = origReadFileSync.call(fs, p, opts);\n"
+                "          pkgCache.set(p, text);\n"
+                "        }\n"
+                "        return text;\n"
+                "      }\n"
+                "      return origReadFileSync.apply(fs, arguments);\n"
+                "    };\n"
+                "    syncEsm();\n"
+                "    disableBootCache = () => {\n"
+                "      if (!bootCacheActive) return;\n"
+                "      bootCacheActive = false;\n"
+                "      fs.statSync = origStatSync;\n"
+                "      fs.lstatSync = origLstatSync;\n"
+                "      fs.existsSync = origExistsSync;\n"
+                "      origRealpathSync.native = origRealpathNative;\n"
+                "      fs.realpathSync = origRealpathSync;\n"
+                "      fs.readFileSync = origReadFileSync;\n"
+                "      syncEsm();\n"
+                "      statCache.clear(); lstatCache.clear(); realCache.clear(); realNativeCache.clear(); pkgCache.clear();\n"
+                "    };\n"
+                "    const t = setTimeout(disableBootCache, 25000);\n"
+                "    if (t && typeof t.unref === 'function') t.unref();\n"
+                "  }\n"
+                "} catch(e) { writeLog('PRELOAD_BOOT_CACHE_ERR', String(e)); }\n"
                 "try {\n"
                 "  const dummyStdin = new Readable({ read() {} });\n"
                 "  dummyStdin.isTTY = false;\n"
@@ -487,20 +668,51 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "  const origStdoutWrite = process.stdout.write.bind(process.stdout);\n"
                 "  process.stdout.write = function(chunk, encoding, cb) {\n"
                 "    try {\n"
-                "      fs.appendFileSync(outLogFile, chunk);\n"
-                "      const str = chunk.toString();\n"
+                "      const s = getOutLogStream();\n"
+                "      if (s) s.write(chunk);\n"
+                "      const str = typeof chunk === 'string' ? chunk : chunk.toString();\n"
                 "      const m = str.match(/http:\\/\\/127\\.0\\.0\\.1:(\\d+)\\/\\?token=([a-zA-Z0-9_\\-]+)/);\n"
-                "      if (m) {\n"
+                "      if (m && !dshServerReady) {\n"
                 "        dshServerReady = true;\n"
+                "        disableBootCache();\n"
+                "        const readyPort = parseInt(m[1], 10);\n"
                 "        const info = {\n"
                 "          phase: 'running',\n"
-                "          port: parseInt(m[1], 10),\n"
+                "          port: readyPort,\n"
                 "          baseUrl: 'http://127.0.0.1:' + m[1],\n"
                 "          token: m[2],\n"
                 "          url: m[0]\n"
                 "        };\n"
-                "        fs.writeFileSync(readyFile, JSON.stringify(info));\n"
+                "        const payload = JSON.stringify(info);\n"
+                "        try {\n"
+                "          const rReq = http.request({\n"
+                "            hostname: '127.0.0.1',\n"
+                "            port: 38081,\n"
+                "            path: '/v1/host/ready',\n"
+                "            method: 'POST',\n"
+                "            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },\n"
+                "            timeout: 1500\n"
+                "          }, (rRes) => { rRes.resume(); });\n"
+                "          rReq.on('error', () => {});\n"
+                "          rReq.write(payload);\n"
+                "          rReq.end();\n"
+                "        } catch(_re) {}\n"
+                "        fs.writeFile(readyFile, payload, () => {});\n"
                 "        writeLog('READY', `DSH Web Server is ready at ${info.url}`);\n"
+                "        // Persist V8 compile cache to disk after server is ready (app exits via SIGKILL, never natural exit)\n"
+                "        if (typeof Module.flushCompileCache === 'function') {\n"
+                "          const flushOnce = (tag) => {\n"
+                "            try {\n"
+                "              const tFlush = Date.now();\n"
+                "              Module.flushCompileCache();\n"
+                "              writeLog('COMPILE_CACHE_FLUSHED', `${tag} elapsed=${Date.now() - tFlush}ms dir=${process.env.NODE_COMPILE_CACHE || ''}`);\n"
+                "            } catch (_fcErr) {}\n"
+                "          };\n"
+                "          const ft1 = setTimeout(() => flushOnce('t+2500ms'), 2500);\n"
+                "          if (ft1 && typeof ft1.unref === 'function') ft1.unref();\n"
+                "          const ft2 = setTimeout(() => flushOnce('t+10000ms'), 10000);\n"
+                "          if (ft2 && typeof ft2.unref === 'function') ft2.unref();\n"
+                "        }\n"
                 "      }\n"
                 "    } catch(e){}\n"
                 "    return origStdoutWrite(chunk, encoding, cb);\n"
@@ -510,9 +722,10 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "  const origStderrWrite = process.stderr.write.bind(process.stderr);\n"
                 "  process.stderr.write = function(chunk, encoding, cb) {\n"
                 "    try {\n"
-                "      const str = chunk.toString();\n"
+                "      const str = typeof chunk === 'string' ? chunk : chunk.toString();\n"
                 "      if (!str.startsWith('[../../arkweb/') && !str.startsWith('[../../content/') && !str.startsWith('[../../cef/') && !str.startsWith('[../../ohos_nweb/') && !str.startsWith('[../../media/') && !str.startsWith('[../../net/')) {\n"
-                "        fs.appendFileSync(logFile, chunk);\n"
+                "        const s = getErrLogStream();\n"
+                "        if (s) s.write(chunk);\n"
                 "      }\n"
                 "    } catch(e){}\n"
                 "    return origStderrWrite(chunk, encoding, cb);\n"
@@ -919,7 +1132,6 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "        }\n"
                 "        try {\n"
                 "          const inputUrl = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));\n"
-                "          writeLog('FETCH', 'fetch called: ' + inputUrl);\n"
                 "          const parsedUrl = new URL(inputUrl);\n"
                 "          const isHttps = parsedUrl.protocol === 'https:';\n"
                 "          const client = isHttps ? https : http;\n"
@@ -1053,7 +1265,6 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
                 "                      body: { cancel: async () => {} }\n"
                 "                    };\n"
                 "                  }\n"
-                "                  writeLog('FETCH_RES', 'status=' + status + ' len=' + bodyBuffer.length);\n"
                 "                  resolve(respObj);\n"
                 "                });\n"
                 "                res.on('error', err => failAttempt('FETCH_RES_ERR', err));\n"
@@ -1101,7 +1312,6 @@ bool DshHost::Start(const DshHostOptions& options, std::string& errOut) {
         std::vector<std::string> args = {
             "node",
             "--jitless",
-            "--no-opt",
             "--expose-internals",
             "-r",
             preload_js,
@@ -1229,7 +1439,7 @@ void DshHost::StatusWatcherThread() {
                 }
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(is_running ? 1000 : 50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(is_running ? 2000 : 150));
     }
 }
 
@@ -1566,6 +1776,74 @@ int ComputePollTimeoutMs(int64_t deadline_ms, int64_t now_epoch_ms) {
     return static_cast<int>(diff);
 }
 
+bool ParseHostReadyBodyJson(const std::string& body, int& port, std::string& base_url, std::string& token) {
+    port = 0;
+    base_url.clear();
+    token.clear();
+    size_t i = 0;
+    SkipJsonWs(body, i);
+    if (i >= body.size() || body[i] != '{') {
+        return false;
+    }
+    ++i;
+    SkipJsonWs(body, i);
+    if (i < body.size() && body[i] == '}') {
+        return false;
+    }
+    while (i < body.size()) {
+        SkipJsonWs(body, i);
+        std::string key;
+        if (!ParseJsonString(body, i, key)) {
+            return false;
+        }
+        SkipJsonWs(body, i);
+        if (i >= body.size() || body[i] != ':') {
+            return false;
+        }
+        ++i;
+        SkipJsonWs(body, i);
+        if (i >= body.size()) {
+            return false;
+        }
+        if (key == "port" && isdigit(static_cast<unsigned char>(body[i]))) {
+            size_t start = i;
+            while (i < body.size() && isdigit(static_cast<unsigned char>(body[i]))) {
+                ++i;
+            }
+            try {
+                port = std::stoi(body.substr(start, i - start));
+            } catch (...) {
+                port = 0;
+            }
+        } else if (key == "baseUrl" && body[i] == '"') {
+            if (!ParseJsonString(body, i, base_url)) {
+                return false;
+            }
+        } else if (key == "token" && body[i] == '"') {
+            if (!ParseJsonString(body, i, token)) {
+                return false;
+            }
+        } else {
+            if (!SkipJsonValue(body, i)) {
+                return false;
+            }
+        }
+        SkipJsonWs(body, i);
+        if (i >= body.size()) {
+            return false;
+        }
+        if (body[i] == ',') {
+            ++i;
+            continue;
+        }
+        if (body[i] == '}') {
+            return port > 0 && port <= 65535 && !base_url.empty() && !token.empty();
+        }
+        return false;
+    }
+    return false;
+}
+
 void DshHost::HandleToolHttpRequest(int cfd) {
     std::string req_data;
     char buf[2048];
@@ -1612,6 +1890,26 @@ void DshHost::HandleToolHttpRequest(int cfd) {
         ? req_data.substr(body_start, content_length)
         : req_data.substr(body_start);
     OH_LOG_Print(LOG_APP, LOG_DEBUG, 0x3201, "DSHHost", "Tool HTTP Request (%{public}s): %{public}s", req_path.c_str(), body.c_str());
+
+    if (req_path == "/v1/host/ready") {
+        int r_port = 0;
+        std::string r_base_url;
+        std::string r_token;
+        bool ok = ParseHostReadyBodyJson(body, r_port, r_base_url, r_token);
+        if (ok) {
+            swshell::DshState::GetInstance().SetReady(r_port, r_base_url, r_token);
+            NotifyEvent("ready", body);
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0x3201, "DSHHost",
+                         "Fast ready notification received: port=%{public}d", r_port);
+        }
+        std::string resp_json = std::string("{\"ok\":") + (ok ? "true" : "false") + "}";
+        std::string http_resp = "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Content-Length: " + std::to_string(resp_json.size()) + "\r\n"
+                                "Connection: close\r\n\r\n" + resp_json;
+        send(cfd, http_resp.data(), http_resp.size(), 0);
+        return;
+    }
 
     ParsedToolHttpBody parsed;
     ParseToolHttpBodyJson(body, parsed);

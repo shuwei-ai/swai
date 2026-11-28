@@ -21,6 +21,7 @@ export class FloatWindowManager {
   private isShowing: boolean = false;
   private isCompact: boolean = false;
   private isAppForeground: boolean = true;
+  private permissionEnsured: boolean = false;
 
   private currentX: number = 40;
   private currentY: number = 180;
@@ -40,8 +41,13 @@ export class FloatWindowManager {
       AppStorage.setOrCreate('autoFloatEnabled', true);
     }
 
-    // Try to ensure SYSTEM_FLOAT_WINDOW permission via shell bridge in background
-    this.ensurePermissionSilently();
+    // Grant SYSTEM_FLOAT_WINDOW only after the HDC shell bridge actually connects
+    BridgeController.getInstance().addStateListener((snap) => {
+      if (snap.connected && !this.permissionEnsured) {
+        this.permissionEnsured = true;
+        this.ensurePermissionSilently();
+      }
+    });
   }
 
   /**

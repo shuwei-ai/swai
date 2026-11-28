@@ -156,11 +156,17 @@ export class DshAgentManager {
         case 'done':
           this.updateState({
             activeTool: undefined,
-            activeAction: undefined
+            activeAction: undefined,
+            currentThinking: '',
+            currentReply: ''
           });
           break;
         case 'error':
           this.updateState({
+            activeTool: undefined,
+            activeAction: undefined,
+            currentThinking: '',
+            currentReply: '',
             lastError: event.error
           });
           break;
@@ -202,6 +208,9 @@ export class DshAgentManager {
     if (partial.baseUrl !== undefined) {
       this.currentState.baseUrl = partial.baseUrl;
     }
+    if (partial.authToken !== undefined) {
+      this.currentState.authToken = partial.authToken;
+    }
     if (partial.activeTool !== undefined) {
       this.currentState.activeTool = partial.activeTool;
     }
@@ -219,9 +228,8 @@ export class DshAgentManager {
     }
 
     // Synchronize to AppStorage for Float Window and System UI
-    const isRunning = this.currentState.phase === 'running' ||
-      this.currentState.phase === 'starting' ||
-      !!this.currentState.activeTool ||
+    // Only report running while an active turn/tool/stream is in progress (not merely when the background daemon is idle).
+    const isRunning = !!this.currentState.activeTool ||
       this.currentState.currentThinking.length > 0 ||
       this.currentState.currentReply.length > 0;
 
@@ -253,6 +261,16 @@ export class DshAgentManager {
         hilog.error(DOMAIN, TAG, 'Listener error: %{public}s', `${err}`);
       }
     }
+  }
+
+  reportStartError(message: string): void {
+    this.updateState({
+      phase: 'error',
+      isConnected: false,
+      port: 0,
+      baseUrl: '',
+      lastError: message
+    });
   }
 
   async startEngine(runtimeRoot: string, workspaceRoot: string): Promise<boolean> {
@@ -293,9 +311,6 @@ export class DshAgentManager {
       hilog.error(DOMAIN, TAG, 'dshHostStartNative error: %{public}s', `${e}`);
     }
 
-    // Start background Tool Bridge
-    DshToolBridge.getInstance().start();
-
     // Poll until running or timeout (60s for first-launch compile cache generation)
     const startTime = this.engineStartEpochMs;
     let isRunning = false;
@@ -319,10 +334,11 @@ export class DshAgentManager {
         hilog.error(DOMAIN, TAG, 'DSH engine failed to start: %{public}s', lastErrorMsg);
         break;
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
 
     if (isRunning) {
+      DshToolBridge.getInstance().start();
       const elapsedMs = Date.now() - this.engineStartEpochMs;
       this.updateState({
         phase: 'running',
@@ -331,7 +347,7 @@ export class DshAgentManager {
         baseUrl: finalUrl,
         authToken: finalToken
       });
-      hilog.info(DOMAIN, TAG, 'In-process DeepSeek Harness engine ready in %{public}d ms on %{public}s', elapsedMs, finalUrl);
+      hilog.info(DOMAIN, TAG, '[Startup] In-process DeepSeek Harness engine ready in %{public}d ms on %{public}s', elapsedMs, finalUrl);
       return true;
     } else {
       const errDetail = lastErrorMsg.length > 0 ? lastErrorMsg : 'DSH engine start timed out (60s)';

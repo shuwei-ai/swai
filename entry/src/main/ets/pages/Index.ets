@@ -60,11 +60,13 @@ import {
 import { BrowserManager } from '../browser/BrowserManager';
 import { BrowserView } from '../browser/BrowserView';
 import { FloatWindowManager } from '../window/FloatWindowManager';
+import { ThinkingCapsuleManager } from '../window/ThinkingCapsuleManager';
 import { BrowserPipState, PipMode, PipGlowStatus } from '../browser/BrowserPipState';
 import { BrowserHomeView } from '../browser/BrowserHomeView';
 import { BrowserFloatingPip } from '../browser/BrowserFloatingPip';
 import { SideDrawer } from '../components/SideDrawer';
 import { DeveloperDebugGuide } from '../components/DeveloperDebugGuide';
+import { BackgroundKeepAliveManager } from '../service/BackgroundKeepAliveManager';
 
 export interface ExtractedFileRef {
   path: string;
@@ -76,7 +78,24 @@ export interface ExtractedFileRef {
   previewUri?: string;
 }
 
+interface StaticMimeMeta {
+  mime: string;
+  encoding: string;
+}
+
 class SwaiWebBridge {
+  private onUiMountedCallback?: () => void;
+
+  constructor(onUiMountedCallback?: () => void) {
+    this.onUiMountedCallback = onUiMountedCallback;
+  }
+
+  notifyUiMounted(): void {
+    if (this.onUiMountedCallback) {
+      this.onUiMountedCallback();
+    }
+  }
+
   openUrl(url: string): void {
     if (!url || url.length === 0 || url === 'about:blank') {
       return;
@@ -112,7 +131,9 @@ class SwaiWebBridge {
 @Entry
 @Component
 struct Index {
-  private swaiWebBridge: SwaiWebBridge = new SwaiWebBridge();
+  private swaiWebBridge: SwaiWebBridge = new SwaiWebBridge(() => {
+    this.markDshUiReady('js_mount');
+  });
   // Shell Console States
   @State private host: string = '127.0.0.1';
   @State private port: string = '';
@@ -156,8 +177,15 @@ struct Index {
   @State private isDshLoading: boolean = true;
   @State private dshLoadingStatusText: string = 'DeepSeek Harness 正在启动...';
   @State private dshLoadingDetailText: string = 'Node.js 运行时与手机宿主环境正在初始化...';
+  @State private instantDraftText: string = '';
   private isAutoLoadingDsh: boolean = false;
-  private appStartMs: number = Date.now();
+  private dshWebAttached: boolean = false;
+  private pendingDshUrl: string = '';
+  private lastLoadedDshUrl: string = '';
+  private deferredInitStarted: boolean = false;
+  private deferredInitTimer: number = -1;
+  private removeDshStateListener?: () => void = undefined;
+  private appStartMs: number = AppStorage.get<number>('appStartEpochMs') ?? Date.now();
   @State private isBrowserOverlayVisible: boolean = false;
   private removeOverlayListener?: () => void = undefined;
 
@@ -237,11 +265,11 @@ struct Index {
 
   aboutToAppear(): void {
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    this.appStartMs = AppStorage.get<number>('appStartEpochMs') ?? this.appStartMs;
     try {
       webview.WebCookieManager.putAcceptCookieEnabled(true);
       webview.WebCookieManager.putAcceptThirdPartyCookieEnabled(true);
     } catch (_cookieErr) {}
-    BrowserManager.getInstance().init(9222);
     this.removeOverlayListener = BrowserManager.getInstance().onShowOverlay(() => {
       // Mika-styled Picture-in-Picture floating window
       BrowserPipState.getInstance().showMini();
@@ -254,18 +282,235 @@ struct Index {
     this.removeDebugStateListener = () => {
       BridgeController.getInstance().removeStateListener(onBridgeSnapshot);
     };
-    this.applyDebugSnapshot(BridgeController.getInstance().getDebugSnapshot());
-    this.refresh();
-    this.tryAutoConnect();
-    this.initAgent();
+
+    const onDshState = (state: DshUiState): void => {
+      this.dshEnginePort = state.port;
+      if (state.port > 0) {
+        BrowserManager.getInstance().setProtectedDshPort(state.port);
+      }
+      if (state.phase === 'running' && state.port > 0) {
+        const authUrl = DshAgentManager.getInstance().getAuthenticatedUrl();
+        if (authUrl && authUrl.length > 0) {
+          this.loadDshIntoWebview(authUrl);
+          return;
+        }
+        this.startDshAutoLoader();
+      } else if (state.phase === 'error' && !this.isDshReady) {
+        this.dshLoadingStatusText = 'DSH 启动遇到错误';
+        this.dshLoadingDetailText = state.lastError || '请点击重试加载';
+      }
+    };
+    DshAgentManager.getInstance().addUiStateListener(onDshState);
+    this.removeDshStateListener = () => {
+      DshAgentManager.getInstance().removeUiStateListener(onDshState);
+    };
+
     this.initWindowListener();
     this.startDshAutoLoader();
-    DshAgentManager.getInstance().addUiStateListener((state: DshUiState) => {
-      this.dshEnginePort = state.port;
-      if (state.phase === 'running' && state.port > 0) {
-        this.startDshAutoLoader();
+
+    // Defer developer debugging (HDC), agent stores, and keep-alive off the cold-start critical path
+    // so DSH server startup & first-screen WebView render finish without CPU/IO contention.
+    this.deferredInitTimer = setTimeout(() => {
+      this.deferredInitTimer = -1;
+      this.runDeferredInit();
+    }, 10000);
+  }
+
+  private runDeferredInit(): void {
+    if (this.deferredInitStarted) {
+      return;
+    }
+    this.deferredInitStarted = true;
+    if (this.deferredInitTimer !== -1) {
+      clearTimeout(this.deferredInitTimer);
+      this.deferredInitTimer = -1;
+    }
+    hilog.info(0x3F00, 'Index', '[Startup] Starting deferred parallel init at %{public}d ms', Date.now() - this.appStartMs);
+    this.applyDebugSnapshot(BridgeController.getInstance().getDebugSnapshot());
+    this.loadGrants();
+    this.tryAutoConnect();
+    this.initAgent();
+    BackgroundKeepAliveManager.getInstance().ensureStarted();
+  }
+
+  private loadDshUrl(url: string): void {
+    if (!url || url.length === 0) {
+      return;
+    }
+    if (!this.dshWebAttached) {
+      this.pendingDshUrl = url;
+      return;
+    }
+    try {
+      this.dshWebviewController.loadUrl(url);
+    } catch (_e) {
+      this.pendingDshUrl = url;
+    }
+  }
+
+  private isAllowedDshUrl(url: string): boolean {
+    if (!url || this.dshEnginePort <= 0) {
+      return false;
+    }
+    const localIp = `http://127.0.0.1:${this.dshEnginePort}`;
+    const localHost = `http://localhost:${this.dshEnginePort}`;
+    return url === localIp || url.startsWith(`${localIp}/`) || url.startsWith(`${localIp}?`) ||
+      url === localHost || url.startsWith(`${localHost}/`) || url.startsWith(`${localHost}?`);
+  }
+
+  private recoverDshWebviewIfHijacked(reason: string): void {
+    if (!this.dshWebAttached || !this.dshUrl || this.dshUrl.length === 0 || this.dshEnginePort <= 0) {
+      return;
+    }
+    try {
+      const currentUrl = this.dshWebviewController.getUrl() || '';
+      if (!this.isAllowedDshUrl(currentUrl)) {
+        hilog.warn(0x3F00, 'Index', '[DshGuard] Detected hijacked DSH WebView (reason=%{public}s, url=%{public}s), restoring %{public}s',
+          reason, currentUrl, this.dshUrl);
+        this.loadDshUrl(this.dshUrl);
       }
-    });
+    } catch (e) {
+      hilog.warn(0x3F00, 'Index', '[DshGuard] getUrl failed during %{public}s check: %{public}s', reason, JSON.stringify(e));
+    }
+  }
+
+  private loadDshIntoWebview(authUrl: string): void {
+    if (this.lastLoadedDshUrl === authUrl && (this.isDshReady || this.dshUrl === authUrl)) {
+      return;
+    }
+    this.lastLoadedDshUrl = authUrl;
+    const elapsedMs = Date.now() - this.appStartMs;
+    hilog.info(0x3F00, 'Index', '[Startup] DSH HTTP server ready in %{public}d ms, loading into Webview: %{public}s', elapsedMs, authUrl);
+    this.dshUrl = authUrl;
+    this.dshLoadingStatusText = '正在加载界面...';
+    this.dshLoadingDetailText = '正在渲染 Swai 交互界面，马上就好';
+    this.isAutoLoadingDsh = false;
+    this.loadDshUrl(authUrl);
+  }
+
+  private markDshUiReady(source: string): void {
+    this.isDshLoading = false;
+    if (!this.dshUrl || this.dshUrl.length === 0 || this.dshUrl.includes('about:blank')) {
+      return;
+    }
+    if (!this.isDshReady) {
+      this.isDshReady = true;
+      hilog.info(0x3F00, 'Index', '[Startup] DSH main UI ready in %{public}d ms (via %{public}s)',
+        Date.now() - this.appStartMs, source);
+      const draft = this.instantDraftText.trim();
+      if (draft.length > 0) {
+        this.instantDraftText = '';
+        try {
+          this.dshWebviewController.runJavaScript(
+            `(function(){if(window.__swaiFillDraft&&window.__swaiFillDraft(${JSON.stringify(draft)}))return 'ok';return 'miss';})()`
+          ).then((res: string) => {
+            if (!res || !res.includes('ok')) {
+              this.swaiWebBridge.copyToClipboard(draft);
+            }
+          }).catch((_e: Error) => {
+            this.swaiWebBridge.copyToClipboard(draft);
+          });
+        } catch (_e) {
+          this.swaiWebBridge.copyToClipboard(draft);
+        }
+      }
+      this.runDeferredInit();
+    }
+  }
+
+  private resolveStaticMime(filePath: string): StaticMimeMeta {
+    const lower = filePath.toLowerCase();
+    if (lower.endsWith('.js') || lower.endsWith('.mjs')) {
+      return { mime: 'text/javascript', encoding: 'utf-8' };
+    }
+    if (lower.endsWith('.css')) {
+      return { mime: 'text/css', encoding: 'utf-8' };
+    }
+    if (lower.endsWith('.woff2')) {
+      return { mime: 'font/woff2', encoding: '' };
+    }
+    if (lower.endsWith('.woff')) {
+      return { mime: 'font/woff', encoding: '' };
+    }
+    if (lower.endsWith('.svg')) {
+      return { mime: 'image/svg+xml', encoding: 'utf-8' };
+    }
+    if (lower.endsWith('.png')) {
+      return { mime: 'image/png', encoding: '' };
+    }
+    if (lower.endsWith('.json') || lower.endsWith('.webmanifest')) {
+      return { mime: 'application/json', encoding: 'utf-8' };
+    }
+    return { mime: 'application/octet-stream', encoding: '' };
+  }
+
+  private interceptDshStaticAsset(event?: OnInterceptRequestEvent): WebResourceResponse | null {
+    if (!event || !event.request || this.dshEnginePort <= 0) {
+      return null;
+    }
+    try {
+      if (event.request.getRequestMethod() !== 'GET') {
+        return null;
+      }
+      const reqUrl = event.request.getRequestUrl();
+      const originPrefix = `http://127.0.0.1:${this.dshEnginePort}/`;
+      if (!reqUrl.startsWith(originPrefix)) {
+        return null;
+      }
+      const qIdx = reqUrl.indexOf('?', originPrefix.length);
+      const pathname = qIdx >= 0
+        ? reqUrl.substring(originPrefix.length - 1, qIdx)
+        : reqUrl.substring(originPrefix.length - 1);
+      const isRootAsset = pathname === '/favicon.svg'
+        || pathname === '/favicon-dark.svg'
+        || pathname === '/apple-touch-icon.png'
+        || pathname === '/icon-192.png'
+        || pathname === '/icon-maskable-512.png'
+        || pathname === '/manifest.webmanifest';
+      if (!pathname.startsWith('/assets/') && !isRootAsset) {
+        return null;
+      }
+      if (pathname.includes('..') || pathname.includes('\\')) {
+        return null;
+      }
+      const localPath = `${AgentWorkspace.getInstance().getDshRuntimeDir()}/node_modules/@deepseek-ai/dsh-web-frontend/dist${pathname}`;
+      const stat = fs.statSync(localPath);
+      if (!stat.isFile() || stat.size <= 0 || stat.size > 8 * 1024 * 1024) {
+        return null;
+      }
+      const buf = new ArrayBuffer(stat.size);
+      const file = fs.openSync(localPath, fs.OpenMode.READ_ONLY);
+      try {
+        let total = 0;
+        while (total < stat.size) {
+          const n = fs.readSync(file.fd, buf, { offset: total, length: stat.size - total });
+          if (n <= 0) {
+            break;
+          }
+          total += n;
+        }
+        if (total !== stat.size) {
+          return null;
+        }
+      } finally {
+        fs.closeSync(file);
+      }
+      const meta = this.resolveStaticMime(localPath);
+      const resp = new WebResourceResponse();
+      resp.setResponseData(buf);
+      resp.setResponseEncoding(meta.encoding);
+      resp.setResponseMimeType(meta.mime);
+      resp.setResponseCode(200);
+      resp.setReasonMessage('OK');
+      resp.setResponseIsReady(true);
+      resp.setResponseHeader([
+        { headerKey: 'Cache-Control', headerValue: 'public, max-age=31536000, immutable' },
+        { headerKey: 'Access-Control-Allow-Origin', headerValue: '*' }
+      ]);
+      return resp;
+    } catch (_err) {
+      return null;
+    }
   }
 
   onPageShow(): void {
@@ -274,9 +519,18 @@ struct Index {
 
   onAppForegroundTick(): void {
     this.triggerForegroundRecheckIfNeeded();
+    this.recoverDshWebviewIfHijacked('foreground');
   }
 
   aboutToDisappear(): void {
+    if (this.deferredInitTimer !== -1) {
+      clearTimeout(this.deferredInitTimer);
+      this.deferredInitTimer = -1;
+    }
+    if (this.removeDshStateListener) {
+      this.removeDshStateListener();
+      this.removeDshStateListener = undefined;
+    }
     if (this.removeDebugStateListener) {
       this.removeDebugStateListener();
       this.removeDebugStateListener = undefined;
@@ -299,24 +553,21 @@ struct Index {
     }
     this.isAutoLoadingDsh = true;
 
-    // Loop until server is ready or timeout (65s)
+    const existingState = DshAgentManager.getInstance().getState();
+    const existingUrl = DshAgentManager.getInstance().getAuthenticatedUrl();
+    if (existingState.phase === 'running' && existingState.port > 0 && existingUrl && existingUrl.length > 0) {
+      this.loadDshIntoWebview(existingUrl);
+      return;
+    }
+
+    // Event-driven fast path is handled by addUiStateListener; keep lightweight fallback probe
     const startTime = Date.now();
     while (Date.now() - startTime < 65000 && !this.isDshReady) {
       const state = DshAgentManager.getInstance().getState();
       const authUrl = DshAgentManager.getInstance().getAuthenticatedUrl();
 
       if (state.phase === 'running' && state.port > 0 && authUrl && authUrl.length > 0) {
-        const elapsedMs = Date.now() - this.appStartMs;
-        hilog.info(0x3F00, 'Index', 'DSH HTTP server ready in %{public}d ms, loading into Webview: %{public}s', elapsedMs, authUrl);
-        this.dshUrl = authUrl;
-        this.dshLoadingStatusText = '正在加载界面...';
-        this.dshLoadingDetailText = '正在渲染 Swai 交互界面，马上就好';
-        try {
-          this.dshWebviewController.loadUrl(authUrl);
-        } catch (e) {
-          // ignore
-        }
-        this.isAutoLoadingDsh = false;
+        this.loadDshIntoWebview(authUrl);
         return;
       } else if (state.phase === 'error') {
         this.dshLoadingStatusText = 'DSH 启动遇到错误';
@@ -336,6 +587,8 @@ struct Index {
 
   private reloadDsh(): void {
     this.isDshReady = false;
+    this.lastLoadedDshUrl = '';
+    this.dshUrl = '';
     this.dshLoadingStatusText = '正在重新加载...';
     this.dshLoadingDetailText = '正在重新探测服务状态并连接';
     this.startDshAutoLoader();
@@ -400,7 +653,14 @@ struct Index {
       return;
     }
     const store = AgentConfigStore.getInstance();
-    const config = await store.load(this.context);
+    const ctx = this.context;
+    const loaded = await Promise.all([
+      store.load(ctx),
+      MemoryStore.getInstance().init(ctx),
+      SkillManager.getInstance().init(ctx),
+      GoalManager.getInstance().init()
+    ]);
+    const config = loaded[0];
     this.agentBaseUrl = config.baseUrl;
     this.agentApiKey = config.apiKey;
     this.agentModelName = config.modelName;
@@ -417,24 +677,9 @@ struct Index {
     this.remoteWorkDir = remoteCfg.defaultWorkDir;
     this.remoteFingerprint = remoteCfg.expectedFingerprint;
 
-    await MemoryStore.getInstance().init(this.context);
     this.memoryLessons = [...MemoryStore.getInstance().getLessons()];
-
-    await SkillManager.getInstance().init(this.context);
     this.skillsList = [...SkillManager.getInstance().getSkills()];
-
-    await GoalManager.getInstance().init();
     this.updateGoalUI();
-
-    if (this.context) {
-      const filesDir = this.context.filesDir;
-      AgentWorkspace.getInstance().ensureDshRuntime().then((runtimeDir: string) => {
-        const rt = runtimeDir && runtimeDir.length > 0 ? runtimeDir : filesDir;
-        DshAgentManager.getInstance().startEngine(rt, filesDir + '/workspace');
-      }).catch((_e: Object) => {
-        DshAgentManager.getInstance().startEngine(filesDir, filesDir + '/workspace');
-      });
-    }
 
     this.agentSession = new AgentSession(config);
     AppStorage.setOrCreate('agentSession', this.agentSession);
@@ -543,6 +788,7 @@ struct Index {
         AppStorage.setOrCreate('agentCurrentTool', '');
         AppStorage.setOrCreate('agentStatusText', '待命');
         AppStorage.setOrCreate('agentThinkingText', '');
+        ThinkingCapsuleManager.getInstance().onTurnComplete('');
         this.updateGoalUI();
         if (this.agentSession) {
           this.agentMessages = [...this.agentSession.getMessages()];
@@ -559,6 +805,7 @@ struct Index {
         AppStorage.setOrCreate('agentCurrentTool', '');
         AppStorage.setOrCreate('agentThinkingText', '');
         AppStorage.setOrCreate('agentStatusText', `错误: ${event.error}`);
+        ThinkingCapsuleManager.getInstance().onTurnError(event.error ?? '');
         promptAction.showToast({ message: `Agent 错误: ${event.error}`, duration: 3500 });
         if (this.agentSession) {
           this.agentSession.getMessages().push({
@@ -579,6 +826,7 @@ struct Index {
         AppStorage.setOrCreate('agentCurrentTool', '');
         AppStorage.setOrCreate('agentThinkingText', '');
         AppStorage.setOrCreate('agentStatusText', '已停止');
+        ThinkingCapsuleManager.getInstance().onTurnStopped();
         if (this.agentSession) {
           this.agentSession.getMessages().push({
             role: 'assistant',
@@ -1709,6 +1957,9 @@ struct Index {
     }
     const now = Date.now();
     const fromSettings = this.waitingForSettingsReturn;
+    if (!fromSettings && !this.deferredInitStarted && (now - this.appStartMs) < 10000) {
+      return;
+    }
     if (!fromSettings && (now - this.lastAutoRecheckMs) < 3000) {
       return;
     }
@@ -3974,8 +4225,43 @@ struct Index {
             .javaScriptProxy({
               object: this.swaiWebBridge,
               name: 'swaiBridge',
-              methodList: ['openUrl', 'copyToClipboard'],
+              methodList: ['openUrl', 'copyToClipboard', 'notifyUiMounted'],
               controller: this.dshWebviewController
+            })
+            .onInterceptRequest((event?: OnInterceptRequestEvent): WebResourceResponse => {
+              const intercepted = this.interceptDshStaticAsset(event);
+              return (intercepted ?? null) as WebResourceResponse;
+            })
+            .onLoadIntercept((event): boolean => {
+              if (!event || !event.data || this.dshEnginePort <= 0) {
+                return false;
+              }
+              try {
+                if (!event.data.isMainFrame()) {
+                  return false;
+                }
+                const reqUrl = event.data.getRequestUrl() || '';
+                if (reqUrl.length === 0 || reqUrl === 'about:blank') {
+                  if (this.isDshReady && this.dshUrl.length > 0) {
+                    hilog.warn(0x3F00, 'Index', '[DshGuard] Blocked unexpected main-frame navigation to %{public}s', reqUrl);
+                    setTimeout(() => {
+                      this.recoverDshWebviewIfHijacked('load_intercept_blank');
+                    }, 50);
+                    return true;
+                  }
+                  return false;
+                }
+                if (!this.isAllowedDshUrl(reqUrl)) {
+                  hilog.warn(0x3F00, 'Index', '[DshGuard] Blocked external main-frame hijack on DSH WebView: %{public}s', reqUrl);
+                  if (reqUrl.startsWith('http://') || reqUrl.startsWith('https://')) {
+                    this.swaiWebBridge.openUrl(reqUrl);
+                  }
+                  return true;
+                }
+              } catch (e) {
+                hilog.warn(0x3F00, 'Index', '[DshGuard] onLoadIntercept error: %{public}s', JSON.stringify(e));
+              }
+              return false;
             })
             .multiWindowAccess(false)
             .mixedMode(MixedMode.All)
@@ -3985,6 +4271,14 @@ struct Index {
             .horizontalScrollBarAccess(true)
             .verticalScrollBarAccess(true)
             .overScrollMode(OverScrollMode.ALWAYS)
+            .onControllerAttached(() => {
+              this.dshWebAttached = true;
+              const pending = this.pendingDshUrl;
+              if (pending.length > 0) {
+                this.pendingDshUrl = '';
+                this.loadDshUrl(pending);
+              }
+            })
             .onPageBegin(() => {
               this.isDshLoading = true;
               try {
@@ -4044,69 +4338,159 @@ struct Index {
                 // ignore
               }
             })
-            .onPageEnd(() => {
-              this.isDshLoading = false;
-              if (this.dshUrl && this.dshUrl.length > 0 && !this.dshUrl.includes('about:blank')) {
-                this.isDshReady = true;
-                hilog.info(0x3F00, 'Index', 'DSH main UI ready in %{public}d ms', Date.now() - this.appStartMs);
-              }
+            .onFirstContentfulPaint(() => {
+              this.markDshUiReady('fcp');
             })
-            .onErrorReceive(() => {
-              hilog.warn(0x3F00, 'Index', 'DSH webview error, scheduling auto retry...');
+            .onPageEnd((event) => {
+              const endedUrl = event?.url || '';
+              if (this.isDshReady && this.dshEnginePort > 0 && !this.isAllowedDshUrl(endedUrl)) {
+                hilog.warn(0x3F00, 'Index', '[DshGuard] DSH WebView ended on non-DSH URL (%{public}s), auto-restoring...', endedUrl);
+                this.recoverDshWebviewIfHijacked('onPageEnd');
+                return;
+              }
+              this.markDshUiReady('page_end');
+            })
+            .onErrorReceive((event) => {
+              let errCode = 0;
+              try {
+                errCode = event?.error?.getErrorCode() ?? 0;
+              } catch (_e) {}
+              if (errCode === -3 || this.isDshReady) {
+                return;
+              }
+              hilog.warn(0x3F00, 'Index', 'DSH webview error (%{public}d), scheduling auto retry...', errCode);
               this.isDshReady = false;
+              this.lastLoadedDshUrl = '';
               setTimeout(() => {
                 this.startDshAutoLoader();
               }, 300);
             })
 
-          // DSH Loading Card (when not ready) - Full screen overlay with soft background to prevent white screen
+          // Instant-Open Native Chat Shell (renders in ~300ms while DSH engine boots in background)
           if (!this.isDshReady) {
-            Stack({ alignContent: Alignment.Center }) {
-              Column({ space: 16 }) {
-                LoadingProgress()
-                  .width(52)
-                  .height(52)
-                  .color('#0284c7')
+            Column() {
+              // Top bar
+              Row() {
+                Row({ space: 8 }) {
+                  Circle({ width: 10, height: 10 })
+                    .fill(this.dshEnginePort > 0 ? '#10b981' : '#0284c7')
+                  Text('Swai · DeepSeek Harness')
+                    .fontSize(16)
+                    .fontWeight(FontWeight.Bold)
+                    .fontColor('#0f172a')
+                }
+                .layoutWeight(1)
 
-                Text(this.dshLoadingStatusText)
-                  .fontSize(17)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor('#0f172a')
-
-                Text(this.dshLoadingDetailText)
-                  .fontSize(13)
-                  .fontColor('#64748b')
-                  .textAlign(TextAlign.Center)
-                  .padding({ left: 16, right: 16 })
-
-                Row({ space: 12 }) {
-                  Button('返回 Shell 终端', { type: ButtonType.Normal })
-                    .fontSize(13)
-                    .height(34)
-                    .borderRadius(8)
-                    .backgroundColor('#0284c7')
-                    .fontColor('#ffffff')
+                Row({ space: 8 }) {
+                  Button('Shell', { type: ButtonType.Normal })
+                    .fontSize(12)
+                    .height(28)
+                    .padding({ left: 10, right: 10 })
+                    .borderRadius(14)
+                    .backgroundColor('#e0f2fe')
+                    .fontColor('#0284c7')
                     .onClick(() => {
+                      this.runDeferredInit();
                       this.activeMainTab = 'console';
                     })
 
-                  Button('重试加载', { type: ButtonType.Normal })
-                    .fontSize(13)
-                    .height(34)
-                    .borderRadius(8)
+                  Button('重试', { type: ButtonType.Normal })
+                    .fontSize(12)
+                    .height(28)
+                    .padding({ left: 10, right: 10 })
+                    .borderRadius(14)
                     .backgroundColor('#f1f5f9')
                     .fontColor('#475569')
                     .onClick(() => {
                       this.reloadDsh();
                     })
                 }
-                .margin({ top: 10 })
               }
-              .width('86%')
-              .padding(28)
+              .width('100%')
+              .padding({ left: 16, right: 16, top: 14, bottom: 12 })
               .backgroundColor('#ffffff')
-              .borderRadius(20)
-              .shadow({ radius: 24, color: 'rgba(0, 0, 0, 0.08)', offsetX: 0, offsetY: 4 })
+              .border({ width: { bottom: 0.6 }, color: '#e2e8f0' })
+
+              // Center live status + lightweight skeleton preview
+              Column({ space: 18 }) {
+                Column({ space: 10 }) {
+                  LoadingProgress()
+                    .width(42)
+                    .height(42)
+                    .color('#0284c7')
+
+                  Text(this.dshLoadingStatusText)
+                    .fontSize(17)
+                    .fontWeight(FontWeight.Bold)
+                    .fontColor('#0f172a')
+
+                  Text(this.dshLoadingDetailText)
+                    .fontSize(12)
+                    .fontColor('#64748b')
+                    .textAlign(TextAlign.Center)
+                }
+                .padding({ top: 20, bottom: 12 })
+
+                // Subtle chat skeleton placeholders
+                Column({ space: 10 }) {
+                  Row()
+                    .width('72%')
+                    .height(14)
+                    .borderRadius(7)
+                    .backgroundColor('#e2e8f0')
+                  Row()
+                    .width('92%')
+                    .height(14)
+                    .borderRadius(7)
+                    .backgroundColor('#eef2f7')
+                  Row()
+                    .width('56%')
+                    .height(14)
+                    .borderRadius(7)
+                    .backgroundColor('#eef2f7')
+                }
+                .width('86%')
+                .padding(16)
+                .alignItems(HorizontalAlign.Start)
+                .backgroundColor('#ffffff')
+                .borderRadius(14)
+                .border({ width: 0.8, color: '#e2e8f0' })
+              }
+              .width('100%')
+              .layoutWeight(1)
+              .justifyContent(FlexAlign.Center)
+              .alignItems(HorizontalAlign.Center)
+
+              // Interactive bottom draft bar so user can type immediately while engine finishes starting
+              Column({ space: 6 }) {
+                if (this.instantDraftText.trim().length > 0) {
+                  Text('✓ 草稿已暂存，界面就绪后将自动填入')
+                    .fontSize(11)
+                    .fontColor('#0284c7')
+                    .width('100%')
+                    .padding({ left: 4 })
+                }
+                Row({ space: 8 }) {
+                  TextInput({
+                    placeholder: '正在后台唤醒引擎，现在即可先输入想法...',
+                    text: this.instantDraftText
+                  })
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(14)
+                    .backgroundColor('#f8fafc')
+                    .borderRadius(21)
+                    .padding({ left: 16, right: 16 })
+                    .onChange((val: string) => {
+                      this.instantDraftText = val;
+                    })
+                }
+                .width('100%')
+              }
+              .width('100%')
+              .padding({ left: 14, right: 14, top: 10, bottom: 16 })
+              .backgroundColor('#ffffff')
+              .border({ width: { top: 0.6 }, color: '#e2e8f0' })
             }
             .width('100%')
             .height('100%')
@@ -4135,33 +4519,33 @@ struct Index {
         .height('100%')
       }
 
-      // 2. Subtle Floating Edge Pull-Tab to open SideDrawer (Zero obstruction to top header)
+      // 2. Subtle Frosted Edge Pull-Tab to open SideDrawer (HarmonyOS native material)
       if (!this.isDrawerOpen) {
         Stack({ alignContent: Alignment.TopEnd }) {
           Row() {
-            Text('›')
-              .fontSize(16)
-              .fontWeight(FontWeight.Bold)
-              .fontColor('#ffffff')
+            SymbolGlyph($r('sys.symbol.chevron_right'))
+              .fontSize(14)
+              .fontColor([$r('sys.color.icon_secondary')])
           }
-          .width(24)
-          .height(52)
-          .backgroundColor('rgba(15, 23, 42, 0.5)')
+          .width(22)
+          .height(48)
+          .backgroundColor($r('sys.color.comp_background_list_card'))
+          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK)
           .borderRadius({ topRight: 14, bottomRight: 14, topLeft: 0, bottomLeft: 0 })
+          .shadow({ radius: 10, color: 'rgba(0, 0, 0, 0.10)', offsetX: 2, offsetY: 0 })
           .justifyContent(FlexAlign.Center)
           .alignItems(VerticalAlign.Center)
 
           if (!this.connected && this.debugPhase !== 'checking') {
-            Circle({ width: 7, height: 7 })
-              .fill(this.debugPhase === 'auth_rejected' ? '#ef4444' : '#f59e0b')
-              .stroke('#ffffff')
-              .strokeWidth(1)
+            Circle({ width: 6, height: 6 })
+              .fill(this.debugPhase === 'auth_rejected' ? $r('sys.color.warning') : $r('sys.color.alert'))
               .margin({ top: 5, right: 4 })
           }
         }
-        .width(24)
-        .height(52)
+        .width(22)
+        .height(48)
         .position({ x: 0, y: '48%' })
+        .clickEffect({ level: ClickEffectLevel.LIGHT })
         .onClick(() => {
           this.isDrawerOpen = true;
         })
@@ -4192,9 +4576,16 @@ struct Index {
         onSelectPage: (page: string) => {
           this.isDrawerOpen = false;
           if (page === 'console' || page === 'dsh' || page === 'browser') {
+            if (page === 'console' || page === 'browser') {
+              this.runDeferredInit();
+            }
             this.activeMainTab = page as ('console' | 'dsh' | 'browser');
-            if (page === 'dsh' && !this.isDshReady) {
-              this.startDshAutoLoader();
+            if (page === 'dsh') {
+              if (!this.isDshReady) {
+                this.startDshAutoLoader();
+              } else {
+                this.recoverDshWebviewIfHijacked('select_dsh');
+              }
             }
           } else if (page === 'settings') {
             this.showSettings = true;
@@ -4217,6 +4608,7 @@ struct Index {
         },
         onOpenDebugGuide: () => {
           this.isDrawerOpen = false;
+          this.runDeferredInit();
           this.isDebugGuideOpen = true;
         }
       })

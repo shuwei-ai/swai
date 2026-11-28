@@ -24,6 +24,13 @@ export interface OcrTextLine {
   confidence?: number;
 }
 
+export interface OcrRoiBounds {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
 export interface OcrResult {
   ok: boolean;
   fullText: string;
@@ -31,6 +38,9 @@ export interface OcrResult {
   imageWidth: number;
   imageHeight: number;
   durationMs: number;
+  roiBounds?: OcrRoiBounds;
+  excludeBounds?: OcrRoiBounds[];
+  excludedCount?: number;
   error?: string;
 }
 
@@ -120,10 +130,31 @@ export class PhoneOcr {
     }
   }
 
+  private static isLineInExcludedRect(line: OcrTextLine, rect: OcrRoiBounds, pad: number): boolean {
+    const exLeft = rect.left - pad;
+    const exTop = rect.top - pad;
+    const exRight = rect.right + pad;
+    const exBottom = rect.bottom + pad;
+
+    if (line.cx >= exLeft && line.cx <= exRight && line.cy >= exTop && line.cy <= exBottom) {
+      return true;
+    }
+
+    const interW = Math.min(line.right, exRight) - Math.max(line.left, exLeft);
+    const interH = Math.min(line.bottom, exBottom) - Math.max(line.top, exTop);
+    if (interW <= 0 || interH <= 0) {
+      return false;
+    }
+    const lineArea = Math.max(1, (line.right - line.left) * (line.bottom - line.top));
+    return (interW * interH) / lineArea >= 0.35;
+  }
+
   /**
    * Captures the current live screen and performs OCR recognition directly.
+   * When roiBounds is provided (e.g. target app window in split-screen), keeps lines inside that ROI.
+   * When excludeBounds is provided (e.g. PiP Thinking Capsule / overlay), drops lines overlapping those rects.
    */
-  static async recognizeScreen(): Promise<OcrResult> {
+  static async recognizeScreen(roiBounds?: OcrRoiBounds, excludeBounds?: OcrRoiBounds[]): Promise<OcrResult> {
     const startTime = Date.now();
     try {
       // 1. Hardware snapshot to /data/local/tmp/_ocr_screen.jpeg (~100ms)
@@ -189,6 +220,49 @@ export class PhoneOcr {
 
       try {
         const result = await PhoneOcr.recognizePixelMap(pixelMap);
+        if (result.ok && (roiBounds || (excludeBounds && excludeBounds.length > 0))) {
+          const pad = 8;
+          let filteredLines = result.lines;
+          if (roiBounds) {
+            filteredLines = filteredLines.filter(l =>
+              l.cx >= roiBounds.left - pad &&
+              l.cx <= roiBounds.right + pad &&
+              l.cy >= roiBounds.top - pad &&
+              l.cy <= roiBounds.bottom + pad
+            );
+          }
+          let excludedCount = 0;
+          if (excludeBounds && excludeBounds.length > 0) {
+            const afterExclude: OcrTextLine[] = [];
+            for (let i = 0; i < filteredLines.length; i++) {
+              const line = filteredLines[i];
+              let hit = false;
+              for (let j = 0; j < excludeBounds.length; j++) {
+                if (PhoneOcr.isLineInExcludedRect(line, excludeBounds[j], 12)) {
+                  hit = true;
+                  break;
+                }
+              }
+              if (hit) {
+                excludedCount++;
+              } else {
+                afterExclude.push(line);
+              }
+            }
+            filteredLines = afterExclude;
+          }
+          return {
+            ok: result.ok,
+            fullText: filteredLines.map(l => l.text).join('\n'),
+            lines: filteredLines,
+            imageWidth: result.imageWidth,
+            imageHeight: result.imageHeight,
+            durationMs: result.durationMs,
+            roiBounds: roiBounds,
+            excludeBounds: excludeBounds,
+            excludedCount: excludedCount
+          };
+        }
         return result;
       } finally {
         try {
@@ -223,7 +297,13 @@ export class PhoneOcr {
     if (!result.ok) {
       return `[OCR Error]: ${result.error ?? 'Unknown error'}`;
     }
-    const header = `[OCR Text Recognition] ${result.imageWidth}x${result.imageHeight} | Found ${result.lines.length} text lines (${result.durationMs}ms):`;
+    const roiText = result.roiBounds
+      ? ` ROI=[${result.roiBounds.left},${result.roiBounds.top}][${result.roiBounds.right},${result.roiBounds.bottom}]`
+      : '';
+    const exclText = result.excludedCount && result.excludedCount > 0
+      ? ` (excluded ${result.excludedCount} overlay lines)`
+      : '';
+    const header = `[OCR Text Recognition] ${result.imageWidth}x${result.imageHeight}${roiText} | Found ${result.lines.length} text lines${exclText} (${result.durationMs}ms):`;
     if (result.lines.length === 0) {
       return `${header}\n(No readable text detected on screen)`;
     }

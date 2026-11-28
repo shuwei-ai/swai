@@ -51,6 +51,14 @@
     {
       "name": "permission_float_window_desc",
       "value": "用于在跨应用自动化执行时展示智能体状态与实时思考悬浮窗"
+    },
+    {
+      "name": "permission_location_desc",
+      "value": "用于在后台保持智能体长时任务持续运行，避免切换应用时被系统冻结"
+    },
+    {
+      "name": "permission_bg_location_desc",
+      "value": "用于在切至后台执行跨应用自动化任务时保持进程保活"
     }
   ]
 }

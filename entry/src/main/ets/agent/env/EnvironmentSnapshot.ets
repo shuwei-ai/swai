@@ -49,7 +49,7 @@ export class EnvironmentSnapshot {
       screenHeight: EnvironmentSnapshot.cachedResolution.height,
       timestampStr: timeStr,
       networkConstraint: 'Device shell has NO curl, wget, python, or node/npm. Use "fetch" for HTTP, "run_code" (supports Python 3 and JavaScript) for offline data computation/JSON processing, and "remote_bash" for remote server tasks.',
-      uiAutomationBridge: 'Structured "ui" tool (uitest/uinput + JSON layout parser) and ArkWeb CDP on 127.0.0.1:9222'
+      uiAutomationBridge: 'Structured "ui" tool (uitest/uinput + JSON layout parser) and ArkWeb CDP on 127.0.0.1:9222 (CRITICAL: CDP 9222 is process-global and also lists the host Swai/DSH chat WebView; NEVER navigate, evaluate, or setDocumentContent on the DSH chat target—always exclude targets whose URL is the local DSH server port and only use the dedicated browser target or the "browser" tool)'
     };
     return info;
   }

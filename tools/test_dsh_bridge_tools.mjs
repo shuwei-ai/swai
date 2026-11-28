@@ -67,6 +67,18 @@ Module.prototype.require = function(id) {
   }
   return origRequire.apply(this, arguments);
 };
+const origOut = process.stdout.write.bind(process.stdout);
+let flushed = false;
+process.stdout.write = function(chunk, ...rest) {
+  const s = typeof chunk === 'string' ? chunk : chunk.toString();
+  if (!flushed && /http:\\/\\/127\\.0\\.0\\.1:\\d+\\/\\?token=/.test(s)) {
+    flushed = true;
+    if (process.env.NODE_COMPILE_CACHE && typeof Module.flushCompileCache === 'function') {
+      try { Module.flushCompileCache(); } catch (_e) {}
+    }
+  }
+  return origOut(chunk, ...rest);
+};
 `, 'utf8');
   }
 
@@ -86,7 +98,7 @@ Module.prototype.require = function(id) {
   const startMs = Date.now();
   const child = spawn(
     process.execPath,
-    ['--jitless', '--no-opt', '--expose-internals', '-r', preloadPath, binJs, 'web', '--host', '127.0.0.1', '--port', '0', '--no-open'],
+    ['--jitless', '--expose-internals', '-r', preloadPath, binJs, 'web', '--host', '127.0.0.1', '--port', '0', '--no-open'],
     { cwd: staging, env, stdio: ['ignore', 'pipe', 'pipe'] }
   );
 
@@ -276,7 +288,7 @@ async function runTests() {
 
     swaiToolsMod.apply(mockCtx);
 
-    // Verify exact 12 registered tools (4 native + 6 browser_* + 2 wechat_*)
+    // Verify exact 13 registered tools (4 native + 6 browser_* + 2 wechat_* + ui_skill_save)
     assert.deepEqual(
       [...registered.keys()].sort(),
       [
@@ -290,29 +302,102 @@ async function runTests() {
         'offline_code',
         'remote_bash',
         'ui',
+        'ui_skill_save',
         'wechat_post_draft',
         'wechat_render_article'
       ],
-      'swai-tools should register exactly 12 unified tools'
+      'swai-tools should register exactly 13 unified tools'
     );
     assert.equal(promptSections.length, 1);
     assert.ok(promptSections[0].text().includes('browser_navigate'));
     assert.ok(!promptSections[0].text().includes('mcp__swai__'));
     assert.ok(promptSections[0].text().includes('capture_screen'));
     assert.ok(promptSections[0].text().includes('run_sequence'));
+    assert.ok(promptSections[0].text().includes('ui_skill_save'));
 
     // Verify ui schema updates
     const uiTool = registered.get('ui');
     for (const key of [
       'anchor', 'use_ocr', 'auto_send', 'clear_first', 'ability_name',
+      'clone_index', 'auto_select_clone',
       'contains_text', 'clickable_only', 'include_all', 'limit', 'click_mode',
       'x1', 'y1', 'x2', 'y2', 'duration_ms', 'type'
     ]) {
       assert.ok(key in uiTool.parameters.properties, `ui tool missing parameter: ${key}`);
     }
-    for (const act of ['hide_overlay', 'show_overlay', 'minimize_overlay', 'run_sequence', 'click_anchor', 'ocr']) {
+    for (const act of ['hide_overlay', 'show_overlay', 'minimize_overlay', 'run_sequence', 'click_anchor', 'ocr', 'list_apps']) {
       assert.ok(uiTool.parameters.properties.action.enum.includes(act), `ui tool missing action: ${act}`);
     }
+
+    // Verify UI trajectory recording + strict input redaction + ui_skill_save validation/save
+    process.env.DSH_HOME = path.join(staging, 'home-opt/.dsh');
+    swaiToolsMod.clearSanitizedUiTrace();
+    await uiTool.execute({ action: 'launch_app', bundle_name: 'com.tencent.wechat' }, {});
+    await uiTool.execute({ action: 'input_text', text: 'SearchBox', content: 'MY_SECRET_MSG_12345', auto_send: true }, {});
+    await uiTool.execute({
+      action: 'run_sequence',
+      bundle_name: 'com.tencent.wechat',
+      steps: [
+        { op: 'tap', target: '发现' },
+        { op: 'type', target: '搜索', text: 'ANOTHER_SECRET_XYZ', auto_send: false }
+      ]
+    }, {});
+
+    const trace = swaiToolsMod.getSanitizedUiTrace();
+    assert.equal(trace.length, 3);
+    assert.equal(trace[1].bundleName, 'unknown'); // mock server returned mock-ok:ui without Screen header
+    assert.ok(trace[1].target.includes('<输入内容>'));
+    assert.ok(!trace[1].target.includes('MY_SECRET_MSG_12345'), 'raw typed input must never appear in trace');
+    assert.ok(trace[2].target.includes('type(搜索, <输入内容>)'));
+    assert.ok(!trace[2].target.includes('ANOTHER_SECRET_XYZ'), 'raw run_sequence typed input must never appear in trace');
+
+    const skillSaveTool = registered.get('ui_skill_save');
+    const traceOut = await skillSaveTool.execute({ mode: 'inspect_trace' }, {});
+    assert.ok(traceOut.text.includes('Sanitized UI Trajectory (3 steps'));
+    assert.ok(!traceOut.text.includes('MY_SECRET_MSG_12345'));
+
+    // Reject missing 5 sections
+    const badSections = await skillSaveTool.execute({
+      mode: 'save',
+      name: 'wechat-bad-skill',
+      description: 'Missing sections test skill',
+      markdown: '## 入口\n只有一节是不够的，应该被校验逻辑拒绝。'
+    }, {});
+    assert.ok(badSections.text.startsWith('Error:'), 'missing required 5 sections should fail validation');
+
+    // Reject literal 6-digit OTP / secrets
+    const badSecret = await skillSaveTool.execute({
+      mode: 'save',
+      name: 'wechat-secret-skill',
+      description: 'Contains sensitive code test',
+      markdown: '## 入口\n微信\n## 步骤\n输入 123456\n## 容易出错的地方\n无\n## 怎样算办成\n完成\n## 什么时候停下交给用户\n付款前停下'
+    }, {});
+    assert.ok(badSecret.text.startsWith('Error:'), '6-digit numeric secret should be rejected');
+
+    // Valid 5-section skill save into $DSH_HOME/skills/<name>/SKILL.md
+    const validSave = await skillSaveTool.execute({
+      mode: 'save',
+      name: 'wechat-smoke-check',
+      description: '打开微信并进入发现页的基础核查技能',
+      status: 'trial',
+      apps: ['com.tencent.wechat'],
+      markdown: [
+        '## 入口',
+        '- 包名 com.tencent.wechat，页面 pages/WechatAppPage。',
+        '## 步骤',
+        '1. 调用 ui(action="launch_app", bundle_name="com.tencent.wechat")。',
+        '2. 若出现「选择打开方式」，点击主体微信行。',
+        '## 容易出错的地方',
+        '- 未聚焦输入框需使用 anchor="chat_input"。',
+        '## 怎样算办成',
+        '- 顶部标题显示目标页面名称且树节点匹配成功。',
+        '## 什么时候停下交给用户',
+        '- 任何支付、转账或发送敏感消息前必须停下确认。'
+      ].join('\n')
+    }, {});
+    assert.ok(validSave.text.includes('Saved UI automation skill "wechat-smoke-check"'), validSave.text);
+    const savedSkillPath = path.join(staging, 'home-opt/.dsh/skills/wechat-smoke-check/SKILL.md');
+    assert.ok(fs.existsSync(savedSkillPath), 'SKILL.md should exist on disk');
 
     // Verify offline_code supports path without requiring code
     const codeTool = registered.get('offline_code');
@@ -439,6 +524,48 @@ async function runTests() {
       '  disabled: true',
       '- id: ui-message-feedback',
       '  disabled: true',
+      '- id: directory-picker',
+      '  disabled: true',
+      '- id: ui-shortcuts',
+      '  disabled: true',
+      '- id: ui-sidebar-terminal',
+      '  disabled: true',
+      '- id: terminal-controller',
+      '  disabled: true',
+      '- id: ui-plugin-manager',
+      '  disabled: true',
+      '- id: harness-dev-context',
+      '  disabled: true',
+      '- id: ui-cordis',
+      '  disabled: true',
+      '- id: session-log-download',
+      '  disabled: true',
+      '- id: ui-trajectory',
+      '  disabled: true',
+      '- id: cli-account',
+      '  disabled: true',
+      '- id: remote-connection',
+      '  disabled: true',
+      '- id: ui-settings-shell',
+      '  disabled: true',
+      '- id: ui-settings-session-log',
+      '  disabled: true',
+      '- id: entry-customization',
+      '  disabled: true',
+      '- id: ui-workflow-run',
+      '  disabled: true',
+      '- id: agent-team',
+      '  disabled: true',
+      '- id: tool-agent-team',
+      '  disabled: true',
+      '- id: ui-agent-team',
+      '  disabled: true',
+      '- id: ui-account-notifications',
+      '  disabled: true',
+      '- id: session-turn-outline',
+      '  disabled: true',
+      '- id: ui-session-panel',
+      '  disabled: true',
       ''
     ].join('\n');
 
@@ -461,6 +588,7 @@ async function runTests() {
     });
     assert.equal(optColdRes.statusCode, 200);
     assert.ok(!optColdRes.stderr.includes('did not activate'), `Unexpected Cordis plugin warning:\n${optColdRes.stderr}`);
+    assert.ok(!optColdRes.stderr.includes('ignored:') && !optColdRes.stderr.includes('skill entry'), `Unexpected skill parse warning:\n${optColdRes.stderr}`);
 
     const optWarmRes = await bootRealDshWeb({
       staging,
@@ -471,6 +599,76 @@ async function runTests() {
     });
     assert.equal(optWarmRes.statusCode, 200);
     assert.ok(!optWarmRes.stderr.includes('did not activate'), `Unexpected Cordis plugin warning:\n${optWarmRes.stderr}`);
+
+    // Guard: ensure no disabled client plugin breaks an enabled browser plugin's injected services
+    const disabledIds = new Set(
+      [...optimizedPatch.matchAll(/^- id:\s*(\S+)\s*\n\s*disabled:\s*true/gm)].map((m) => m[1])
+    );
+    const idToPkg = new Map();
+    for (const bundle of ['dsh-base', 'dsh-web-app']) {
+      const ymlPath = path.join(staging, `node_modules/@deepseek-ai/${bundle}/cordis.patch.yml`);
+      if (!fs.existsSync(ymlPath)) continue;
+      let curId = null;
+      for (const line of fs.readFileSync(ymlPath, 'utf8').split('\n')) {
+        const mId = line.match(/^\s*-\s*id:\s*(\S+)/);
+        if (mId) curId = mId[1];
+        const mName = line.match(/^\s*name:\s*["']?([^"'\s]+)["']?/);
+        if (mName && curId) idToPkg.set(curId, mName[1]);
+      }
+    }
+    const requiredClientServices = new Map();
+    for (const [id, pkg] of idToPkg.entries()) {
+      if (disabledIds.has(id)) continue;
+      const pkgDir = path.join(staging, 'node_modules', pkg.split('/').slice(0, 2).join('/'));
+      const pjPath = path.join(pkgDir, 'package.json');
+      if (!fs.existsSync(pjPath)) continue;
+      const pj = JSON.parse(fs.readFileSync(pjPath, 'utf8'));
+      for (const svc of pj.dsh?.client?.inject || []) {
+        if (!requiredClientServices.has(svc)) requiredClientServices.set(svc, []);
+        requiredClientServices.get(svc).push(id);
+      }
+    }
+    for (const id of disabledIds) {
+      const pkg = idToPkg.get(id);
+      if (!pkg) continue;
+      const cjs = path.join(staging, 'node_modules', pkg.split('/').slice(0, 2).join('/'), 'lib/client.js');
+      if (!fs.existsSync(cjs)) continue;
+      const src = fs.readFileSync(cjs, 'utf8');
+      const provided = [
+        ...[...src.matchAll(/provide\(["'`]([a-zA-Z0-9_.-]+)["'`]/g)].map((m) => m[1]),
+        ...[...src.matchAll(/super\([^,]+,\s*["'`]([a-zA-Z0-9_.-]+)["'`]/g)].map((m) => m[1])
+      ];
+      for (const svc of provided) {
+        const consumers = requiredClientServices.get(svc);
+        assert.equal(
+          consumers,
+          undefined,
+          `Disabled plugin "${id}" provides client service "${svc}" required by enabled plugins: ${(consumers || []).join(', ')}`
+        );
+      }
+    }
+
+    // Guard: ensure no host-plane provider required by standard agent preset is disabled
+    for (const requiredHostId of ['plugin-manager', 'ptc-runtime', 'cordis-inspect-providers']) {
+      assert.equal(
+        disabledIds.has(requiredHostId),
+        false,
+        `Host plugin "${requiredHostId}" must remain enabled for standard agent preset sessions`
+      );
+    }
+    const standardPresetYml = path.join(staging, 'node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml');
+    if (fs.existsSync(standardPresetYml)) {
+      const presetText = fs.readFileSync(standardPresetYml, 'utf8');
+      if (presetText.includes('@deepseek-ai/dsh-plugin-manager/tools')) {
+        assert.equal(disabledIds.has('plugin-manager'), false);
+      }
+      if (presetText.includes('@deepseek-ai/dsh-workflow-ptc')) {
+        assert.equal(disabledIds.has('ptc-runtime'), false);
+      }
+      if (presetText.includes('@deepseek-ai/dsh-tool-cordis')) {
+        assert.equal(disabledIds.has('cordis-inspect-providers'), false);
+      }
+    }
 
     console.log(
       `[DSH Boot Benchmark --jitless] baseline=${baselineRes.bootMs}ms | opt_cold=${optColdRes.bootMs}ms | opt_warm=${optWarmRes.bootMs}ms`

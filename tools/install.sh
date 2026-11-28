@@ -70,6 +70,10 @@ if [ -n "$TOKEN_ID" ]; then
     "$HDC" -t "$TARGET" shell "atm perm -g -i $TOKEN_ID -p ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY" || true
     echo "==> granting ohos.permission.READ_WRITE_DOCUMENTS_DIRECTORY (token: $TOKEN_ID)"
     "$HDC" -t "$TARGET" shell "atm perm -g -i $TOKEN_ID -p ohos.permission.READ_WRITE_DOCUMENTS_DIRECTORY" || true
+    echo "==> granting background keep-alive location permissions (token: $TOKEN_ID)"
+    "$HDC" -t "$TARGET" shell "atm perm -g -i $TOKEN_ID -p ohos.permission.APPROXIMATELY_LOCATION" || true
+    "$HDC" -t "$TARGET" shell "atm perm -g -i $TOKEN_ID -p ohos.permission.LOCATION" || true
+    "$HDC" -t "$TARGET" shell "atm perm -g -i $TOKEN_ID -p ohos.permission.LOCATION_IN_BACKGROUND" || true
 fi
 
 echo "==> launching application"
