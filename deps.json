@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "binaries": [
+    {
+      "name": "libnode",
+      "description": "Prebuilt Node.js shared library for HarmonyOS NEXT (aarch64-linux-ohos)",
+      "dest": "entry/libs/arm64-v8a/libnode.so",
+      "sha256": "3019bf5f9a279d98a87606fc13c53b0e797b6a50cf174f8a1243d880c71151a1",
+      "archive": "libnode-ohos-arm64.tar.gz",
+      "archiveSha256": "ea620b832425a2705d454f829535a378bec3d26c600a65413a35c79f2139724b",
+      "envUrlOverride": "SWAI_LIBNODE_URL",
+      "urls": [
+        "https://github.com/shuwei-ai/swai/releases/download/prebuilt-deps-v1/libnode-ohos-arm64.tar.gz"
+      ]
+    }
+  ],
+  "generated": [
+    {
+      "name": "dsh-runtime",
+      "description": "Bundled @deepseek-ai/dsh runtime + Swai bridge scripts",
+      "dest": "entry/src/main/resources/rawfile/dsh-runtime.zip",
+      "buildScript": "tools/build_dsh_runtime.mjs",
+      "args": ["0.2.3-alpha.2"]
+    }
+  ]
+}

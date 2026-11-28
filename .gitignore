@@ -49,3 +49,7 @@ shuweihshell/
 
 # Specifications
 docs/superpowers/
+
+# External prebuilt & generated runtime artifacts (managed by deps.json & tools/fetch_deps.mjs)
+entry/libs/arm64-v8a/libnode.so
+entry/src/main/resources/rawfile/dsh-runtime.zip

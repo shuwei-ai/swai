@@ -72,10 +72,11 @@
 - **系统版本**: HarmonyOS NEXT 5.0+ (如 Mate 60 / Pura 70 系列或开发者真机)
 
 ### 编译与构建
-1. 克隆本项目：
+1. 克隆本项目并准备外部运行时依赖（首次会自动下载 `libnode.so` 并本地构建 `dsh-runtime.zip`，本地已存在时自动跳过）：
    ```bash
    git clone https://github.com/shuwei-ai/swai.git
    cd swai
+   node tools/fetch_deps.mjs
    ```
 2. 在 DevEco Studio 中打开项目，并在 `File -> Project Structure -> Signing Configs` 中勾选 `Automatically generate signature` 生成您的个人本地调试证书。
 3. 执行编译打包：

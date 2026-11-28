@@ -36,6 +36,11 @@ if [ -f "build-profile.json5.local" ] && grep -q '"signingConfigs": \[\]' build-
     SIGN_PATCHED=1
 fi
 
+if [ ! -f "entry/libs/arm64-v8a/libnode.so" ] || [ ! -f "entry/src/main/resources/rawfile/dsh-runtime.zip" ]; then
+    echo "==> preparing external dependencies (libnode.so / dsh-runtime.zip)"
+    node tools/fetch_deps.mjs
+fi
+
 echo "==> building"
 "$DEVECO/tools/hvigor/bin/hvigorw" assembleHap \
     --mode module -p product=default -p module=entry@default --no-daemon
